@@ -243,3 +243,51 @@ class ReconciliationReport(BaseModel):
     position_drift: list[dict[str, Any]] = Field(default_factory=list)
     order_drift: list[dict[str, Any]] = Field(default_factory=list)
     details: str = ""
+
+
+class Regime(str, Enum):
+    """Market regime labels, ordered from most bearish to most bullish.
+
+    The ordering is meaningful: CRASH < BEAR < NEUTRAL < BULL < EUPHORIA along a
+    return axis. `ORDERED_REGIMES` and `rank` expose that ordering.
+    """
+
+    CRASH = "Crash"
+    BEAR = "Bear"
+    NEUTRAL = "Neutral"
+    BULL = "Bull"
+    EUPHORIA = "Euphoria"
+
+    @property
+    def rank(self) -> int:
+        """Position on the ordered axis (0 = CRASH ... 4 = EUPHORIA)."""
+        return ORDERED_REGIMES.index(self)
+
+
+# The canonical low-to-high ordering used to map ranked HMM states to labels.
+ORDERED_REGIMES: list[Regime] = [
+    Regime.CRASH,
+    Regime.BEAR,
+    Regime.NEUTRAL,
+    Regime.BULL,
+    Regime.EUPHORIA,
+]
+
+
+class RegimeState(BaseModel):
+    """The detected regime for a single bar.
+
+    `probabilities` is the distribution over the ordered regime labels and sums
+    to approximately 1. `state_index` is the raw HMM hidden state that the label
+    was mapped from, kept for diagnostics.
+    """
+
+    ts_utc: str
+    regime: Regime
+    state_index: int
+    probabilities: dict[str, float] = Field(default_factory=dict)
+
+    @property
+    def confidence(self) -> float:
+        """Probability mass on the chosen regime label."""
+        return self.probabilities.get(self.regime.value, 0.0)

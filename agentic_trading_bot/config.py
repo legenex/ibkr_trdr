@@ -82,6 +82,8 @@ class Settings(BaseSettings):
     journal_dir: str = Field(default="journal")
     data_cache_dir: str = Field(default="journal/cache")
     log_level: str = Field(default="INFO")
+    # Central seed for any randomness (model fitting, sampling) so runs reproduce.
+    random_seed: int = Field(default=42, ge=0)
 
     @field_validator("log_level")
     @classmethod

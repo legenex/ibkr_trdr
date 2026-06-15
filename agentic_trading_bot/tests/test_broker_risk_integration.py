@@ -15,10 +15,22 @@ AccountState.
 """
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from core.contracts import Order, OrderSide, OrderType
-from testsupport.fakes import FakeIB, liquid_daily_bars
+from testsupport.fakes import FakeIB, funded_account, liquid_daily_bars
+
+
+def _long_position(symbol: str = "AAPL", quantity: float = 100.0, avg_cost: float = 100.0):
+    """A broker-reported long position, shaped as FakeIB.positions() returns them."""
+    return SimpleNamespace(
+        account="DU1",
+        contract=SimpleNamespace(symbol=symbol),
+        position=quantity,
+        avgCost=avg_cost,
+    )
 
 
 def _entry_with_stop(**overrides) -> Order:
@@ -142,4 +154,88 @@ def test_bracket_order_also_passes_through_the_real_gate(make_client):
     assert result.accepted is False
     assert result.risk_decision.evaluator == "risk-gate"
     assert ib.placed == []
+    assert _events(audit, "RISK_VETO")
+
+
+# ----------------------------------------- drawdown circuit breakers (broker)
+#
+# These exercise the full M1 path: the BROKER builds the AccountState, including
+# the equity baselines it tracks itself (set_equity_baselines), and reports the
+# drawn-down NetLiquidation. The gate is the real wired RiskGate, evaluated end to
+# end through place_order, not in isolation.
+
+
+def test_daily_drawdown_breaker_vetoes_new_entry(make_client):
+    # Day opened at 100k; the account is now drawn down past the daily limit.
+    client, ib, audit = make_client()
+    client.connect(base_backoff=0)
+    day_start = 100_000.0
+    limit = client.settings.max_daily_drawdown_pct
+    drawn_down = day_start * (1 - (limit + 2) / 100.0)  # comfortably past the limit
+    ib._account = funded_account(drawn_down)
+    client.set_equity_baselines(day_start=day_start)  # week baseline left unset
+
+    result = client.place_order(_entry_with_stop(quantity=10))
+
+    assert result.accepted is False
+    assert result.risk_decision.evaluator == "risk-gate"
+    assert any("daily drawdown" in v for v in result.risk_decision.vetoes)
+    # New risk is blocked and nothing is sent to the broker.
+    assert ib.placed == []
+    assert "AAPL" not in client._intended_positions
+    assert _events(audit, "RISK_VETO")
+
+
+def test_drawdown_breaker_still_allows_a_risk_reducing_exit(make_client):
+    # Same drawn-down day, but now there is an open AAPL long and the order
+    # reduces it. The breaker blocks new risk; it must never trap an open
+    # position, so this exit is approved and reaches the broker.
+    client, ib, audit = make_client()
+    client.connect(base_backoff=0)
+    day_start = 100_000.0
+    limit = client.settings.max_daily_drawdown_pct
+    drawn_down = day_start * (1 - (limit + 2) / 100.0)
+    ib._account = funded_account(drawn_down)
+    ib._positions = [_long_position("AAPL", quantity=100.0)]
+    client.set_equity_baselines(day_start=day_start)
+
+    # A sell that reduces the long. place_order mandates an attached stop, so the
+    # exit carries one; the gate sees a risk-reducing exit and bypasses entries.
+    exit_order = Order(
+        symbol="AAPL",
+        side=OrderSide.SELL,
+        quantity=50,
+        order_type=OrderType.LMT,
+        limit_price=100.0,
+        stop_price=105.0,
+    )
+    result = client.place_order(exit_order)
+
+    assert result.accepted is True
+    assert result.risk_decision.evaluator == "risk-gate"
+    assert any("exit" in r for r in result.risk_decision.reasons)
+    # The exit really reached the broker (entry leg + protective stop).
+    assert len(ib.placed) == 2
+    assert client._intended_positions["AAPL"] == -50
+    assert _events(audit, "ORDER_SUBMITTED")
+
+
+def test_weekly_drawdown_breaker_vetoes_new_entry(make_client):
+    # Week opened at 100k; the account is now drawn down past the weekly limit.
+    # The daily baseline is left unset so only the weekly breaker is in play.
+    client, ib, audit = make_client()
+    client.connect(base_backoff=0)
+    week_start = 100_000.0
+    limit = client.settings.max_weekly_drawdown_pct
+    drawn_down = week_start * (1 - (limit + 2) / 100.0)
+    ib._account = funded_account(drawn_down)
+    client.set_equity_baselines(week_start=week_start)  # day baseline left unset
+
+    result = client.place_order(_entry_with_stop(quantity=10))
+
+    assert result.accepted is False
+    assert result.risk_decision.evaluator == "risk-gate"
+    assert any("weekly drawdown" in v for v in result.risk_decision.vetoes)
+    assert ib.placed == []
+    assert "AAPL" not in client._intended_positions
     assert _events(audit, "RISK_VETO")
