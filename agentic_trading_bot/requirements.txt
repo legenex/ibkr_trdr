@@ -7,7 +7,7 @@
 ib_async==2.1.0
 
 # Orchestration and agents (Claude Agent SDK; bundles the Claude Code CLI).
-claude-agent-sdk==0.2.101
+claude-agent-sdk==0.2.102
 
 # Config and message schemas.
 pydantic==2.13.4

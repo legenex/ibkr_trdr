@@ -10,8 +10,9 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Optional
+from uuid import uuid4
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 def _utc_now_iso() -> str:
@@ -368,3 +369,95 @@ class Signal(BaseModel):
     def is_flat(self) -> bool:
         """True if this signal targets no position."""
         return abs(self.target_weight) <= 1e-9
+
+
+# ---------------------------------------------------------------------------
+# Agentic discovery contracts (research -> signal -> validation pipeline)
+# ---------------------------------------------------------------------------
+
+
+class Source(BaseModel):
+    """A cited source backing a research brief."""
+
+    title: str
+    url: str = ""
+    kind: str = "web"  # web | news | filing
+    snippet: str = ""
+
+
+class ResearchBrief(BaseModel):
+    """Thematic context gathered by the research agent. Read-only product."""
+
+    theme: str
+    summary: str
+    key_points: list[str] = Field(default_factory=list)
+    watchlist: list[str] = Field(default_factory=list)
+    sources: list[Source] = Field(default_factory=list)
+    ts_utc: str = Field(default_factory=_utc_now_iso)
+
+
+class StrategyProposal(BaseModel):
+    """A candidate strategy spec proposed by the signal agent. Rules only.
+
+    `template` must name a known strategy template (the agent proposes which
+    parameterized template to use, never arbitrary code). `intended_stop` is
+    required: a proposal without a stop is not a proposal.
+    """
+
+    name: str
+    hypothesis: str
+    template: str
+    parameters: dict[str, Any] = Field(default_factory=dict)
+    universe: list[str] = Field(default_factory=list)
+    intended_regimes: list[str] = Field(default_factory=list)
+    intended_stop: str
+    rationale: str = ""
+    proposed_by: str = "signal-agent"
+    ts_utc: str = Field(default_factory=_utc_now_iso)
+
+    @field_validator("intended_stop")
+    @classmethod
+    def _stop_required(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("a strategy proposal must state an intended stop")
+        return value
+
+
+class ProposalStatus(str, Enum):
+    """Lifecycle of a proposal in the approval queue."""
+
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+
+
+class ProposalValidation(BaseModel):
+    """One symbol's validation result for a proposal."""
+
+    symbol: str
+    result: ValidationResult
+
+
+class Proposal(BaseModel):
+    """A candidate spec plus its validation, as queued for human approval.
+
+    `passed` is derived only from the ValidationResults; the validation agent's
+    plain-language `summary` can never change it. Approval is a separate human
+    action recorded later; this object is created PENDING and never self-approves.
+    """
+
+    proposal_id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    spec: StrategyProposal
+    validations: list[ProposalValidation] = Field(default_factory=list)
+    passed: bool = False
+    summary: str = ""
+    status: ProposalStatus = ProposalStatus.PENDING
+    created_ts: str = Field(default_factory=_utc_now_iso)
+    decided_by: Optional[str] = None
+    decided_ts: Optional[str] = None
+    decision_reason: str = ""
+
+    @property
+    def approvable(self) -> bool:
+        """Eligible for approval only if it passed the gate. A FAIL never is."""
+        return self.passed
