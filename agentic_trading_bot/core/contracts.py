@@ -245,6 +245,38 @@ class ReconciliationReport(BaseModel):
     details: str = ""
 
 
+class ValidationResult(BaseModel):
+    """Structured verdict from the validation gate.
+
+    This is the object the approval flow and UI consume. `passed` is the only
+    thing that makes a strategy approvable, and `approvable` is derived from it
+    so a FAIL can never be marked approvable downstream.
+
+    `metrics` is nested as period -> {"gross"|"net"} -> metric name -> value, so
+    gross and net are always reported side by side.
+    """
+
+    passed: bool
+    strategy_name: str
+    n_trials: int
+    n_trades: int
+    calendar_days: float
+    deflated_sharpe: float
+    metrics: dict[str, dict[str, dict[str, float]]] = Field(default_factory=dict)
+    walk_forward: list[dict[str, Any]] = Field(default_factory=list)
+    walk_forward_summary: dict[str, float] = Field(default_factory=dict)
+    sensitivity: dict[str, Any] = Field(default_factory=dict)
+    regime_breakdown: dict[str, dict[str, float]] = Field(default_factory=dict)
+    dsr_detail: dict[str, float] = Field(default_factory=dict)
+    reasons: list[str] = Field(default_factory=list)
+    ts_utc: str = Field(default_factory=_utc_now_iso)
+
+    @property
+    def approvable(self) -> bool:
+        """A strategy is approvable only if it passed. FAIL is never approvable."""
+        return self.passed
+
+
 class Regime(str, Enum):
     """Market regime labels, ordered from most bearish to most bullish.
 
@@ -291,3 +323,48 @@ class RegimeState(BaseModel):
     def confidence(self) -> float:
         """Probability mass on the chosen regime label."""
         return self.probabilities.get(self.regime.value, 0.0)
+
+
+class StrategySpec(BaseModel):
+    """Metadata describing a strategy. Crosses module boundaries, so a model.
+
+    `params` are the strategy's current parameter values. `key_parameters` maps
+    the parameters that matter to the perturbation STEP used by the validation
+    gate's sensitivity sweep.
+    """
+
+    name: str
+    category: str  # for example "trend", "breakout", "mean_reversion"
+    description: str = ""
+    params: dict[str, Any] = Field(default_factory=dict)
+    key_parameters: dict[str, float] = Field(default_factory=dict)
+    symbols: list[str] = Field(default_factory=list)
+
+
+class Signal(BaseModel):
+    """A target position for one bar, carrying its intended protective stop.
+
+    `target_weight` is the desired portfolio weight in [-1, 1]. Every non-flat
+    signal carries a `stop_price` so the risk gate can size the position from the
+    distance to the stop. A flat signal (target_weight 0) has no stop.
+    """
+
+    ts_utc: str
+    symbol: str = ""
+    target_weight: float = Field(ge=-1.0, le=1.0)
+    stop_price: Optional[float] = Field(default=None, gt=0)
+    reference_price: Optional[float] = Field(default=None, gt=0)
+    reason: str = ""
+    meta: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _nonflat_requires_stop(self) -> "Signal":
+        """A non-flat target must carry a stop; risk sizing depends on it."""
+        if abs(self.target_weight) > 1e-9 and self.stop_price is None:
+            raise ValueError("a non-flat signal must carry an intended stop_price")
+        return self
+
+    @property
+    def is_flat(self) -> bool:
+        """True if this signal targets no position."""
+        return abs(self.target_weight) <= 1e-9
