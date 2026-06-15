@@ -1,0 +1,11 @@
+# Project tooling config. Run pytest from this directory (agentic_trading_bot).
+# pythonpath = "." puts the package root on sys.path so tests can import the
+# top-level modules (config, utils.*, data.*) directly.
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+addopts = "-q"
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]

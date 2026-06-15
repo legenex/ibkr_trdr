@@ -1,0 +1,22 @@
+# Secrets - never commit real credentials.
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Journal runtime artifacts (keep the directory, ignore its contents).
+agentic_trading_bot/journal/logs/
+agentic_trading_bot/journal/cache/
+agentic_trading_bot/journal/*.db
+agentic_trading_bot/journal/KILL_SWITCH
+!agentic_trading_bot/journal/.gitkeep
+
+# OS / editor
+.DS_Store

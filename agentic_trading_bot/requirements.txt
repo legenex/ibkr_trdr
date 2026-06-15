@@ -1,0 +1,46 @@
+# Agentic Trading Research and Execution Harness - pinned dependencies.
+# Versions verified against PyPI on 2026-06-15. Pins are exact so backtests and
+# audits are reproducible. Bump deliberately, not incidentally.
+
+# Broker. ib_async is the maintained fork of ib_insync (drop-in API). Requires a
+# running TWS or IB Gateway with the API port enabled. Pinned to latest 2.x.
+ib_async==2.1.0
+
+# Orchestration and agents (Claude Agent SDK; bundles the Claude Code CLI).
+claude-agent-sdk==0.2.101
+
+# Config and message schemas.
+pydantic==2.13.4
+pydantic-settings==2.14.1
+python-dotenv==1.2.2
+
+# Logging.
+structlog==26.1.0
+loguru==0.7.3
+
+# Data and ML.
+pandas==3.0.3
+numpy==2.4.6
+scikit-learn==1.9.0
+hmmlearn==0.3.3
+statsmodels==0.14.6
+scipy==1.17.1
+pandas_ta==0.4.71b0
+
+# Backtesting (vectorized option; the custom event-driven engine has no dep).
+vectorbt==1.0.0
+
+# Data sources (fallbacks behind the common data interface).
+yfinance==1.4.1
+polygon-api-client==1.16.3
+
+# Scheduling.
+APScheduler==3.11.2
+
+# UI and charts.
+streamlit==1.58.0
+plotly==6.8.0
+
+# Tests.
+pytest==9.1.0
+pytest-asyncio==1.4.0
