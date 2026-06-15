@@ -24,7 +24,15 @@ from agents.research_agent import run_research
 from agents.signal_agent import StrategyProposalList, run_signal
 from agents.validation_agent import run_validation
 from config import settings as default_settings
-from core.contracts import Proposal, ResearchBrief, Source, StrategyProposal
+from core.contracts import (
+    AppliedSkill,
+    Proposal,
+    ResearchBrief,
+    Skill,
+    SkillType,
+    Source,
+    StrategyProposal,
+)
 from discovery.approval_queue import ApprovalQueue
 from utils.logging import get_logger
 
@@ -54,8 +62,16 @@ class ResearchPipeline:
         audit: Any,
         mcp_servers: Optional[dict[str, Any]] = None,
         detector: Any = None,
+        skill_registry: Any = None,
+        use_skills: bool = False,
+        skill_top_k: int = 3,
     ) -> None:
-        """Create the pipeline from its (injected) collaborators."""
+        """Create the pipeline from its (injected) collaborators.
+
+        Skills are additive and OFF by default. With `use_skills=True` and a
+        registry that returns nothing, behavior is identical to the no-skills
+        path (no prompt changes, no provenance, no SKILLS_APPLIED audit).
+        """
         self.provider = provider
         self.data_source = data_source
         self.gate = gate
@@ -63,7 +79,29 @@ class ResearchPipeline:
         self.audit = audit
         self.mcp_servers = mcp_servers or {}
         self.detector = detector
+        self.skill_registry = skill_registry
+        self.use_skills = use_skills
+        self.skill_top_k = skill_top_k
         self.log = get_logger(__name__)
+
+    def _select_skills(
+        self, theme: str, regime: Optional[str]
+    ) -> tuple[list[Skill], list[Skill], list[AppliedSkill]]:
+        """Query the registry for promoted analysis and signal-shaping skills.
+
+        Returns ([], [], []) when skills are disabled or the registry is empty,
+        which keeps the run byte-for-byte identical to the no-skills path.
+        """
+        if not self.use_skills or self.skill_registry is None:
+            return [], [], []
+        analysis = self.skill_registry.top_skills(
+            skill_type=SkillType.ANALYSIS, regime=regime, theme=theme, k=self.skill_top_k
+        )
+        signal = self.skill_registry.top_skills(
+            skill_type=SkillType.SIGNAL_SHAPING, regime=regime, theme=theme, k=self.skill_top_k
+        )
+        applied = [s.as_applied() for s in (analysis + signal)]
+        return analysis, signal, applied
 
     async def run(
         self,
@@ -72,15 +110,45 @@ class ResearchPipeline:
         start: str = "2023-06-15",
         end: str = "2026-06-16",
         n_trials: int = 1,
+        current_regime: Optional[str] = None,
     ) -> list[Proposal]:
         """Run research -> signal -> validation and enqueue the proposals."""
         self.audit.record("PIPELINE_START", {"theme": theme, "symbols": symbols}, "Discovery pipeline started")
         hooks = _build_hooks(self.audit)
 
+        analysis_skills, signal_skills, applied_skills = self._select_skills(theme, current_regime)
+        if applied_skills:
+            # Invariant: a SKILLS_APPLIED event per run lists the skill ids/versions.
+            self.audit.record(
+                "SKILLS_APPLIED",
+                {
+                    "regime": current_regime,
+                    "theme": theme,
+                    "skills": [
+                        {"skill_id": s.skill_id, "version": s.version, "skill_type": s.skill_type}
+                        for s in applied_skills
+                    ],
+                },
+                f"{len(applied_skills)} promoted skill(s) applied this run",
+            )
+
         brief = await run_research(
-            self.provider, theme, self.audit, watchlist=symbols, mcp_servers=self.mcp_servers, hooks=hooks
+            self.provider,
+            theme,
+            self.audit,
+            watchlist=symbols,
+            mcp_servers=self.mcp_servers,
+            hooks=hooks,
+            analysis_skills=analysis_skills,
         )
-        specs = await run_signal(self.provider, brief, self.audit, universe=symbols)
+        specs = await run_signal(
+            self.provider,
+            brief,
+            self.audit,
+            universe=symbols,
+            analysis_skills=analysis_skills,
+            signal_skills=signal_skills,
+        )
 
         proposals: list[Proposal] = []
         for spec in specs:
@@ -94,6 +162,7 @@ class ResearchPipeline:
                 end=end,
                 detector=self.detector,
                 n_trials=n_trials,
+                applied_skills=applied_skills,
             )
             self.queue.enqueue(proposal)
             self.audit.record(

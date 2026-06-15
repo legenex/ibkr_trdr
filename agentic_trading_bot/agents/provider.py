@@ -135,14 +135,17 @@ class ScriptedProvider:
         hooks: Optional[dict[str, Any]] = None,
         max_turns: int = 1,
     ) -> ProviderResponse:
-        self.calls.append({"agent": agent, "schema": schema.__name__, "kind": "structured"})
+        self.calls.append(
+            {"agent": agent, "schema": schema.__name__, "kind": "structured",
+             "system": system, "prompt": prompt}
+        )
         data = self.responses.get(schema.__name__)
         if data is None:
             raise KeyError(f"ScriptedProvider has no canned response for {schema.__name__}")
         return ProviderResponse(text=data.model_dump_json(), usage=self.usage, data=data)
 
     async def text(self, *, agent: str, system: str, prompt: str) -> ProviderResponse:
-        self.calls.append({"agent": agent, "kind": "text"})
+        self.calls.append({"agent": agent, "kind": "text", "system": system, "prompt": prompt})
         return ProviderResponse(text=self.summary, usage=self.usage, data=None)
 
 

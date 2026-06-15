@@ -13,7 +13,8 @@ from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from agents.provider import LLMProvider, audit_agent_usage
-from core.contracts import ResearchBrief, StrategyProposal
+from agents.skill_context import analysis_addendum, signal_candidate_addendum
+from core.contracts import ResearchBrief, Skill, StrategyProposal
 from strategies.registry import known_templates
 from utils.logging import get_logger
 
@@ -43,6 +44,8 @@ async def run_signal(
     audit: Any,
     universe: Optional[list[str]] = None,
     max_proposals: int = 3,
+    analysis_skills: Optional[list[Skill]] = None,
+    signal_skills: Optional[list[Skill]] = None,
 ) -> list[StrategyProposal]:
     """Generate candidate strategy specs from a research brief.
 
@@ -52,17 +55,21 @@ async def run_signal(
         audit: Audit trail for metering.
         universe: Optional override symbols applied to every proposal.
         max_proposals: Cap on returned proposals.
+        analysis_skills: Analysis-only skills added to the framing context.
+        signal_skills: Signal-shaping skills offered as additional candidate
+            templates. When both lists are empty, the prompt is unchanged.
     """
     templates = known_templates()
+    system = _system(templates) + analysis_addendum(analysis_skills or [])
     prompt = (
         f"Theme: {brief.theme}\nSummary: {brief.summary}\n"
         f"Key points: {brief.key_points}\nWatchlist: {brief.watchlist}\n\n"
         f"Propose up to {max_proposals} candidate strategy specs. Each MUST name a "
         "template from the allowed set and MUST include an intended stop."
-    )
+    ) + signal_candidate_addendum(signal_skills or [], templates)
     response = await provider.structured(
         agent="signal",
-        system=_system(templates),
+        system=system,
         prompt=prompt,
         schema=StrategyProposalList,
     )

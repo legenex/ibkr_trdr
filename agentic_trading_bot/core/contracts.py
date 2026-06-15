@@ -431,6 +431,68 @@ class ProposalStatus(str, Enum):
     REJECTED = "rejected"
 
 
+class SkillType(str, Enum):
+    """Skill taxonomy by blast radius (see Self-learning discipline)."""
+
+    ANALYSIS = "analysis"  # prompt/framing refinements; never shapes what is traded
+    SIGNAL_SHAPING = "signal_shaping"  # registry template + params; treated as a strategy
+    RISK_SUGGESTION = "risk_suggestion"  # suggestion only, never auto-applied
+
+
+class SkillStatus(str, Enum):
+    """Lifecycle of a skill."""
+
+    PROMOTED = "promoted"
+    DEMOTED = "demoted"
+    SHADOW = "shadow"
+
+
+class AppliedSkill(BaseModel):
+    """A compact record of a skill that was active during a run, for provenance."""
+
+    skill_id: str
+    version: int = 1
+    skill_type: str
+    name: str = ""
+    live_performance: float = 0.0
+
+
+class Skill(BaseModel):
+    """A reusable, versioned skill stored in the learning registry.
+
+    Analysis skills carry a `prompt_addendum` only. Signal-shaping skills carry a
+    `template` (which MUST already exist in the strategy registry) plus `params`;
+    they never carry executable code (invariant 14).
+    """
+
+    skill_id: str
+    version: int = 1
+    skill_type: SkillType
+    name: str
+    description: str = ""
+    status: SkillStatus = SkillStatus.PROMOTED
+    regimes: list[str] = Field(default_factory=list)  # empty = applies in all regimes
+    theme_tags: list[str] = Field(default_factory=list)  # empty = applies to all themes
+    prompt_addendum: str = ""  # analysis skills only
+    template: Optional[str] = None  # signal-shaping skills only
+    params: dict[str, Any] = Field(default_factory=dict)
+    live_performance: float = 0.0
+    trials: int = 0
+    provenance: str = ""
+    created_ts: str = Field(default_factory=_utc_now_iso)
+    updated_ts: str = Field(default_factory=_utc_now_iso)
+
+    def as_applied(self) -> AppliedSkill:
+        """Return the compact provenance record for this skill."""
+        return AppliedSkill(
+            skill_id=self.skill_id,
+            version=self.version,
+            skill_type=self.skill_type.value,
+            name=self.name,
+            live_performance=self.live_performance,
+        )
+
+
 class ProposalValidation(BaseModel):
     """One symbol's validation result for a proposal."""
 
@@ -451,6 +513,8 @@ class Proposal(BaseModel):
     validations: list[ProposalValidation] = Field(default_factory=list)
     passed: bool = False
     summary: str = ""
+    # Provenance: which learning skills were active when this proposal was made.
+    applied_skills: list[AppliedSkill] = Field(default_factory=list)
     status: ProposalStatus = ProposalStatus.PENDING
     created_ts: str = Field(default_factory=_utc_now_iso)
     decided_by: Optional[str] = None
@@ -460,4 +524,62 @@ class Proposal(BaseModel):
     @property
     def approvable(self) -> bool:
         """Eligible for approval only if it passed the gate. A FAIL never is."""
+        return self.passed
+
+
+# ---------------------------------------------------------------------------
+# Self-learning contracts (Stage 7.5: experiments against a frozen baseline)
+# ---------------------------------------------------------------------------
+
+
+class PreRegisteredCriteria(BaseModel):
+    """Success criteria fixed and stored BEFORE an experiment runs (invariant 13).
+
+    The verdict reads only these fields, never a metric computed after seeing the
+    result. `target_metric` is the single pre-registered objective the candidate
+    must improve; the remaining fields are the regression guard that forbids
+    buying that improvement with degradation elsewhere.
+    """
+
+    target_metric: str = "oos_net_sharpe"
+    # Candidate target must exceed baseline target by at least this much.
+    min_improvement: float = 0.0
+    # The CUMULATIVE-trial deflated Sharpe must clear this (invariant 11).
+    dsr_threshold: float = 0.95
+    # The candidate must also pass the full validation gate in its own right.
+    require_candidate_gate_pass: bool = True
+    # Regression guard tolerances (must not materially degrade these).
+    max_drawdown_degradation: float = 0.05  # candidate OOS maxDD may worsen by at most this
+    min_profit_factor_ratio: float = 0.9  # candidate PF >= baseline PF * this
+    regime_degradation_tolerance: float = 0.25  # no regime's net Sharpe may drop more than this
+    notes: str = ""
+
+
+class ExperimentResult(BaseModel):
+    """Outcome of one controlled experiment: candidate versus frozen baseline.
+
+    The verdict (`passed`) is computed only against the pre-registered criteria.
+    `cumulative_deflated_sharpe` is recomputed with the running family trial
+    count, so an edge that exists only because many things were tried fails here.
+    A FAIL is never promotable.
+    """
+
+    family: str
+    tranche_id: str
+    target_metric: str
+    passed: bool
+    reasons: list[str] = Field(default_factory=list)
+    trials_charged: int = 0
+    cumulative_trials: int = 0
+    per_run_deflated_sharpe: float = 0.0
+    cumulative_deflated_sharpe: float = 0.0
+    criteria: PreRegisteredCriteria
+    before_after: dict[str, dict[str, float]] = Field(default_factory=dict)
+    baseline: ValidationResult
+    candidate: ValidationResult
+    ts_utc: str = Field(default_factory=_utc_now_iso)
+
+    @property
+    def promotable(self) -> bool:
+        """A FAIL is never promotable downstream; mirrors `passed`."""
         return self.passed

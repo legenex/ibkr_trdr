@@ -24,7 +24,11 @@ import pandas as pd
 import scipy.stats as st
 
 from config import Settings, settings as default_settings
-from core.contracts import ValidationResult
+from core.contracts import (
+    ExperimentResult,
+    PreRegisteredCriteria,
+    ValidationResult,
+)
 from utils.logging import get_logger
 
 _EULER_GAMMA = 0.5772156649015329
@@ -451,6 +455,63 @@ def deflated_sharpe_ratio(
     }
 
 
+def deflated_sharpe_from_detail(detail: dict[str, float], n_trials: int) -> float:
+    """Recompute the Deflated Sharpe from a stored dsr_detail with a new N.
+
+    Only the expected-maximum term sr0 depends on the trial count, so the
+    candidate's per-observation Sharpe, sample size, and moments are reused and
+    the DSR is re-evaluated against the CUMULATIVE family trial count. This is
+    how an edge that exists only because many things were tried is exposed,
+    without re-running the backtest or touching the original gate logic.
+    """
+    sr = float(detail.get("sr", 0.0))
+    t_obs = float(detail.get("t_obs", 0.0))
+    if t_obs < 3:
+        return 0.0
+    skew = float(detail.get("skew", 0.0))
+    kurt = float(detail.get("kurt", 3.0))
+    variance_term = max(1.0 - skew * sr + ((kurt - 1.0) / 4.0) * sr ** 2, 1e-12)
+    var_sr = detail.get("var_sr")
+    var_sr = float(var_sr) if var_sr is not None else max(variance_term / (t_obs - 1), 1e-12)
+
+    n = max(int(n_trials), 1)
+    if n > 1:
+        z1 = float(st.norm.ppf(1.0 - 1.0 / n))
+        z2 = float(st.norm.ppf(1.0 - 1.0 / (n * math.e)))
+        sr0 = math.sqrt(var_sr) * ((1.0 - _EULER_GAMMA) * z1 + _EULER_GAMMA * z2)
+    else:
+        sr0 = 0.0
+    return float(st.norm.cdf((sr - sr0) * math.sqrt(t_obs - 1) / math.sqrt(variance_term)))
+
+
+# Map pre-registered target-metric names to a value extracted from a result.
+def _oos_net(vr: ValidationResult) -> dict[str, float]:
+    return vr.metrics.get("out_of_sample", {}).get("net", {})
+
+
+_TARGET_METRICS: dict[str, Any] = {
+    "oos_net_sharpe": lambda vr: _oos_net(vr).get("sharpe", 0.0),
+    "oos_net_sortino": lambda vr: _oos_net(vr).get("sortino", 0.0),
+    "oos_net_cagr": lambda vr: _oos_net(vr).get("cagr", 0.0),
+    "oos_net_total_return": lambda vr: _oos_net(vr).get("total_return", 0.0),
+}
+
+
+def _target_value(vr: ValidationResult, metric: str) -> float:
+    extractor = _TARGET_METRICS.get(metric, _TARGET_METRICS["oos_net_sharpe"])
+    return float(extractor(vr))
+
+
+def _profit_factor(vr: ValidationResult) -> float:
+    """Profit factor on the OOS net trades, derived from hit rate and win/loss."""
+    net = _oos_net(vr)
+    avg_win_loss = float(net.get("avg_win_loss", 0.0))
+    hit = float(net.get("hit_rate", 0.0))
+    if hit <= 0.0 or hit >= 1.0 or avg_win_loss <= 0.0:
+        return 0.0
+    return min(avg_win_loss * (hit / (1.0 - hit)), 1e9)
+
+
 # ---------------------------------------------------------------------------
 # Purged and embargoed cross validation helper
 # ---------------------------------------------------------------------------
@@ -773,3 +834,143 @@ class ValidationGate:
         except Exception as exc:  # noqa: BLE001
             self.log.warning("regime_breakdown_failed", error=str(exc))
             return {}
+
+    # --------------------------------------------------- experiment (Stage 7.5)
+
+    def experiment(
+        self,
+        baseline: Any,
+        candidate: Any,
+        family: str,
+        holdout_tranche: Any,
+        pre_registered_criteria: PreRegisteredCriteria,
+        ledger: Any,
+        *,
+        trials_charged: int = 1,
+        n_trials_per_run: int = 1,
+        capital: Optional[float] = None,
+        detector: Any = None,
+    ) -> ExperimentResult:
+        """Run one controlled candidate-versus-baseline experiment on a tranche.
+
+        Both specs are run through the EXISTING validation gate on the served
+        tranche. This experiment's trials are charged to the persistent ledger,
+        and the candidate's Deflated Sharpe is recomputed against the CUMULATIVE
+        family trial count (not the per-run N). The verdict is computed only
+        against `pre_registered_criteria`, fixed before the run; no post-hoc
+        metric is read to decide. This method does not change the gate logic or
+        the ValidationResult contract; it composes them.
+
+        Args:
+            baseline: A frozen, gate-compatible strategy (the control).
+            candidate: A gate-compatible strategy differing in exactly one
+                variable from the baseline.
+            family: Strategy family key for cumulative trial accounting.
+            holdout_tranche: A served tranche exposing `.bars` and `.tranche_id`.
+            pre_registered_criteria: Success criteria fixed before the run.
+            ledger: A TrialLedger-like object with `charge(family, n)` returning
+                the new cumulative total.
+            trials_charged: Hypotheses this experiment represents (>= 1).
+            n_trials_per_run: N passed to each individual gate run.
+            capital: Starting capital for the backtests.
+            detector: Optional regime detector reused across both runs.
+        """
+        bars = holdout_tranche.bars
+        tranche_id = getattr(holdout_tranche, "tranche_id", "unknown")
+
+        baseline_vr = self.validate(
+            baseline, bars, n_trials=n_trials_per_run, detector=detector, capital=capital
+        )
+        candidate_vr = self.validate(
+            candidate, bars, n_trials=n_trials_per_run, detector=detector, capital=capital
+        )
+
+        # Charge this experiment's trials, then deflate against the running total.
+        cumulative = int(ledger.charge(family, trials_charged))
+        cumulative_dsr = deflated_sharpe_from_detail(candidate_vr.dsr_detail, cumulative)
+
+        criteria = pre_registered_criteria
+        target = criteria.target_metric
+        base_target = _target_value(baseline_vr, target)
+        cand_target = _target_value(candidate_vr, target)
+        base_dd = float(_oos_net(baseline_vr).get("max_drawdown", 0.0))
+        cand_dd = float(_oos_net(candidate_vr).get("max_drawdown", 0.0))
+        base_pf = _profit_factor(baseline_vr)
+        cand_pf = _profit_factor(candidate_vr)
+
+        reasons: list[str] = []
+        if (cand_target - base_target) < criteria.min_improvement:
+            reasons.append(
+                f"target {target} did not improve enough: candidate {cand_target:.3f} vs "
+                f"baseline {base_target:.3f} (need +{criteria.min_improvement})"
+            )
+        if criteria.require_candidate_gate_pass and not candidate_vr.passed:
+            reasons.append(
+                "candidate did not pass the full validation gate: "
+                + "; ".join(candidate_vr.reasons)
+            )
+        if cumulative_dsr < criteria.dsr_threshold:
+            reasons.append(
+                f"cumulative deflated Sharpe {cumulative_dsr:.3f} below "
+                f"{criteria.dsr_threshold} after {cumulative} cumulative family trials "
+                "(edge does not survive cumulative-trial deflation)"
+            )
+        if cand_dd < base_dd - criteria.max_drawdown_degradation:
+            reasons.append(
+                f"drawdown materially worse: candidate {cand_dd:.3f} vs baseline {base_dd:.3f}"
+            )
+        if cand_pf < base_pf * criteria.min_profit_factor_ratio:
+            reasons.append(
+                f"profit factor degraded: candidate {cand_pf:.3f} vs baseline {base_pf:.3f}"
+            )
+        for regime, base_stats in baseline_vr.regime_breakdown.items():
+            cand_stats = candidate_vr.regime_breakdown.get(regime)
+            if cand_stats is None:
+                continue
+            drop = float(base_stats.get("sharpe", 0.0)) - float(cand_stats.get("sharpe", 0.0))
+            if drop > criteria.regime_degradation_tolerance:
+                reasons.append(
+                    f"regime '{regime}' net Sharpe degraded by {drop:.2f} "
+                    f"(> {criteria.regime_degradation_tolerance} tolerance)"
+                )
+
+        passed = len(reasons) == 0
+        before_after = {
+            target: {"baseline": base_target, "candidate": cand_target,
+                     "delta": cand_target - base_target},
+            "oos_net_max_drawdown": {"baseline": base_dd, "candidate": cand_dd,
+                                     "delta": cand_dd - base_dd},
+            "oos_net_profit_factor": {"baseline": base_pf, "candidate": cand_pf,
+                                      "delta": cand_pf - base_pf},
+            "deflated_sharpe": {
+                "baseline": float(baseline_vr.deflated_sharpe),
+                "candidate": float(candidate_vr.deflated_sharpe),
+                "cumulative_candidate": cumulative_dsr,
+            },
+        }
+
+        result = ExperimentResult(
+            family=family,
+            tranche_id=tranche_id,
+            target_metric=target,
+            passed=passed,
+            reasons=reasons,
+            trials_charged=int(trials_charged),
+            cumulative_trials=cumulative,
+            per_run_deflated_sharpe=float(candidate_vr.deflated_sharpe),
+            cumulative_deflated_sharpe=cumulative_dsr,
+            criteria=criteria,
+            before_after=before_after,
+            baseline=baseline_vr,
+            candidate=candidate_vr,
+        )
+        self.log.info(
+            "experiment_complete",
+            family=family,
+            tranche=tranche_id,
+            passed=passed,
+            cumulative_trials=cumulative,
+            cumulative_dsr=round(cumulative_dsr, 3),
+            reasons=reasons,
+        )
+        return result

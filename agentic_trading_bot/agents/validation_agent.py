@@ -10,7 +10,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from agents.provider import LLMProvider, audit_agent_usage
-from core.contracts import Proposal, ProposalValidation, StrategyProposal
+from core.contracts import AppliedSkill, Proposal, ProposalValidation, StrategyProposal
 from strategies.base import GateAdapter
 from strategies.registry import build_strategy
 from utils.logging import get_logger
@@ -36,6 +36,7 @@ async def run_validation(
     detector: Any = None,
     n_trials: int = 1,
     max_symbols: int = 3,
+    applied_skills: Optional[list[AppliedSkill]] = None,
 ) -> Proposal:
     """Validate a spec on its universe and return a queued (PENDING) Proposal.
 
@@ -49,6 +50,9 @@ async def run_validation(
         detector: Optional shared regime detector passed to the gate.
         n_trials: Trials count fed to the Deflated Sharpe Ratio.
         max_symbols: Cap on how many universe symbols to validate.
+        applied_skills: Skills active during this run, recorded on the proposal
+            as provenance so the human approver sees them in the queue. Skills
+            never change the verdict, which comes only from the gate.
     """
     validations: list[ProposalValidation] = []
     symbols = (spec.universe or [])[:max_symbols]
@@ -77,6 +81,7 @@ async def run_validation(
         validations=validations,
         passed=passed,
         summary=summary,
+        applied_skills=list(applied_skills or []),
     )
     audit.record(
         "PROPOSAL_VALIDATED",
@@ -86,6 +91,9 @@ async def run_validation(
             "passed": passed,
             "symbols": [v.symbol for v in validations],
             "per_symbol_passed": {v.symbol: v.result.passed for v in validations},
+            "applied_skills": [
+                {"skill_id": s.skill_id, "version": s.version} for s in proposal.applied_skills
+            ],
         },
         f"Proposal '{spec.name}' validated: passed={passed}",
     )

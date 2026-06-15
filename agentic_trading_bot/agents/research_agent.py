@@ -11,7 +11,8 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from agents.provider import LLMProvider, audit_agent_usage
-from core.contracts import ResearchBrief
+from agents.skill_context import analysis_addendum
+from core.contracts import ResearchBrief, Skill
 from utils.logging import get_logger
 
 _log = get_logger(__name__)
@@ -34,6 +35,7 @@ async def run_research(
     mcp_servers: Optional[dict[str, Any]] = None,
     hooks: Optional[dict[str, Any]] = None,
     max_turns: int = 8,
+    analysis_skills: Optional[list[Skill]] = None,
 ) -> ResearchBrief:
     """Produce a research brief for a theme, metering usage to the audit trail.
 
@@ -45,8 +47,15 @@ async def run_research(
         allowed_tools: Read-only tools to expose (defaults to web search/fetch/read).
         mcp_servers: Operator's read-only research connectors.
         hooks: The PreToolUse guardrail hooks mapping.
+        analysis_skills: Promoted analysis-only skills whose prompt refinements are
+            added to the system context. When empty, the prompt is unchanged.
     """
     tools = allowed_tools if allowed_tools is not None else ["WebSearch", "WebFetch", "Read"]
+    # Analysis skills refine FRAMING only; they never change what gets traded.
+    system = _SYSTEM
+    addendum = analysis_addendum(analysis_skills or [])
+    if addendum:
+        system = _SYSTEM + addendum
     prompt = (
         f"Theme to research: {theme}\n"
         f"Seed watchlist: {', '.join(watchlist or []) or '(none)'}\n\n"
@@ -56,7 +65,7 @@ async def run_research(
     )
     response = await provider.structured(
         agent="research",
-        system=_SYSTEM,
+        system=system,
         prompt=prompt,
         schema=ResearchBrief,
         allowed_tools=tools,
