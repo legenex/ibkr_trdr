@@ -333,8 +333,10 @@ def test_module_evaluate_delegates_to_real_gate_with_account_state():
     assert decision.approved is True
 
 
-def test_module_evaluate_legacy_dict_path_still_approves():
-    # The stage-2 broker passes a dict context; it must stay runnable.
+def test_module_evaluate_without_account_state_fails_closed():
+    # Post-M1 there is no passthrough: called without an AccountState the module
+    # entry point cannot assess risk, so it vetoes rather than approving.
     decision = evaluate(order(), {"intended_positions": {}})
-    assert decision.approved is True
-    assert IS_PASSTHROUGH_STUB is True
+    assert decision.approved is False
+    assert decision.evaluator == "risk-gate"
+    assert IS_PASSTHROUGH_STUB is False

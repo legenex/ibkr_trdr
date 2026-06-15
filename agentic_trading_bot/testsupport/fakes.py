@@ -11,6 +11,44 @@ from types import SimpleNamespace
 from typing import Any, Callable
 
 
+def funded_account(net_liquidation: float = 100_000.0, account: str = "DU1") -> list[Any]:
+    """Default account summary: a single paper account with net liquidation set.
+
+    The real risk gate sizes against equity, so a connected fake broker reports a
+    funded account by default. Tests override `ib._account` to change this.
+    """
+    return [
+        SimpleNamespace(
+            account=account, tag="NetLiquidation", value=str(net_liquidation), currency="USD"
+        )
+    ]
+
+
+def liquid_daily_bars(
+    n: int = 40, close: float = 100.0, volume: float = 50_000_000.0
+) -> list[Any]:
+    """Default daily history: liquid, gently varying bars.
+
+    The risk gate reads average daily volume and recent returns from history, so
+    a connected fake broker returns a liquid series by default (ADV well above the
+    minimum). Tests override `ib._bars` to drive liquidity or volume vetoes.
+    """
+    bars: list[Any] = []
+    for i in range(n):
+        price = close + (i % 5) * 0.1  # small deterministic wiggle for nonzero returns
+        bars.append(
+            SimpleNamespace(
+                date=f"2026-01-{(i % 28) + 1:02d}",
+                open=price,
+                high=price + 0.5,
+                low=price - 0.5,
+                close=price,
+                volume=volume,
+            )
+        )
+    return bars
+
+
 class FakeEvent:
     """Minimal stand-in for an ib_async event supporting `event + handler`."""
 
@@ -40,12 +78,14 @@ class FakeIB:
         self.connect_calls: list[dict[str, Any]] = []
         self.placed: list[tuple[Any, Any]] = []
 
-        # Canned read data, settable by tests.
-        self._account: list[Any] = []
+        # Canned read data, settable by tests. Defaults make a connected broker
+        # look funded and liquid so the real risk gate has equity and history to
+        # work with; tests override any of these to exercise specific verdicts.
+        self._account: list[Any] = funded_account()
         self._positions: list[Any] = []
         self._fills: list[Any] = []
         self._open_trades: list[Any] = []
-        self._bars: list[Any] = []
+        self._bars: list[Any] = liquid_daily_bars()
 
         # Events.
         self.disconnectedEvent = FakeEvent()

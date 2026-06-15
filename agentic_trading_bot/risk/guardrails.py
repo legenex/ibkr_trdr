@@ -11,12 +11,12 @@ below is independently able to veto; a single evaluation can return several
 reasons at once. Position sizing is the only check that shrinks size; every
 other limit vetoes rather than silently resizing.
 
-The module-level `evaluate(order, context)` is a thin COMPATIBILITY SHIM kept so
-the stage-2 broker stays runnable until merge step M1 wires the broker to build
-an AccountState and call RiskGate directly. When given an AccountState it
-delegates to RiskGate; with a legacy dict context it approves structurally valid
-orders so the not-yet-wired broker is not blocked. Do not rely on the shim for
-real risk control; RiskGate is the gate.
+The module-level `evaluate(order, account_state)` is the stable entry point the
+broker calls. As of merge step M1 the broker builds an AccountState and passes
+it here, so this function delegates straight to RiskGate. If it is ever called
+WITHOUT an AccountState (a legacy dict, or None), it can no longer assess risk,
+so it FAILS CLOSED and vetoes rather than approving. There is no passthrough that
+waves orders through anymore.
 """
 from __future__ import annotations
 
@@ -29,11 +29,9 @@ from config import Settings, settings as default_settings
 from core.contracts import AccountState, Order, OrderSide, RiskDecision
 from utils.logging import get_logger
 
-# True while the BROKER path is still the passthrough shim (flipped at M1). The
-# real RiskGate below is not a stub; this flag only describes the broker wiring.
-IS_PASSTHROUGH_STUB: bool = True
-
-STAGE: str = "stage-3-risk-gate"
+# False since merge step M1: the broker builds an AccountState and calls the real
+# RiskGate. There is no longer a passthrough that approves orders un-assessed.
+IS_PASSTHROUGH_STUB: bool = False
 
 _EVALUATOR = "risk-gate"
 
@@ -370,39 +368,35 @@ class RiskGate:
 
 
 # ---------------------------------------------------------------------------
-# Compatibility shim for the stage-2 broker (removed/replaced at merge step M1).
+# Stable module-level entry point. The broker calls this with a built
+# AccountState; it delegates to RiskGate, and fails closed without one.
 # ---------------------------------------------------------------------------
 
 
-def evaluate(order: Order, context: Optional[Any] = None) -> RiskDecision:
-    """Compatibility entry point used by the not-yet-wired stage-2 broker.
+def evaluate(order: Order, account_state: Optional[Any] = None) -> RiskDecision:
+    """Evaluate an order through the real RiskGate.
 
-    With an AccountState (directly, or under context["account_state"]) this
-    delegates to the real RiskGate. With the legacy dict context it approves
-    structurally valid orders so the broker stays runnable until merge step M1.
+    With an AccountState (directly, or under account_state["account_state"])
+    this delegates to RiskGate. Called without one, it cannot assess risk, so it
+    FAILS CLOSED and vetoes; it never approves an un-assessed order.
     """
-    if isinstance(context, AccountState):
-        return RiskGate().evaluate(order, context)
-    if isinstance(context, Mapping) and isinstance(context.get("account_state"), AccountState):
-        return RiskGate().evaluate(order, context["account_state"])
+    if isinstance(account_state, AccountState):
+        return RiskGate().evaluate(order, account_state)
+    if isinstance(account_state, Mapping) and isinstance(
+        account_state.get("account_state"), AccountState
+    ):
+        return RiskGate().evaluate(order, account_state["account_state"])
 
-    # Legacy path: no account state to evaluate against. Structural sanity only.
-    if not order.symbol or not order.symbol.strip():
-        return RiskDecision.veto("order has no symbol", evaluator=STAGE)
-    if order.quantity <= 0:
-        return RiskDecision.veto(
-            f"order quantity must be positive, got {order.quantity}", evaluator=STAGE
-        )
-    return RiskDecision.approve(
-        "compatibility shim: real RiskGate runs once the broker is wired (merge step M1)",
-        evaluator=STAGE,
-        context=dict(context or {}),
+    return RiskDecision.veto(
+        "risk gate called without an AccountState: cannot assess risk, failing "
+        "closed and vetoing the order",
+        evaluator=_EVALUATOR,
     )
 
 
 class RiskGuardrails:
-    """Object form of the compatibility shim. Prefer RiskGate for real checks."""
+    """Object form of the module-level entry point. Wraps RiskGate."""
 
-    def evaluate(self, order: Order, context: Optional[Any] = None) -> RiskDecision:
+    def evaluate(self, order: Order, account_state: Optional[Any] = None) -> RiskDecision:
         """See module-level `evaluate`."""
-        return evaluate(order, context)
+        return evaluate(order, account_state)

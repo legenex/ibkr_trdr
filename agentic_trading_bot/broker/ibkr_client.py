@@ -20,10 +20,12 @@ from __future__ import annotations
 
 import asyncio
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
 
 from config import Settings, settings as default_settings
 from core.contracts import (
+    AccountState,
     AccountSummary,
     Fill,
     Order,
@@ -45,13 +47,15 @@ from utils.logging import RUN_ID, get_logger
 # the gate and raises GuardrailsUnavailableError.
 try:
     from risk.guardrails import evaluate as _module_risk_evaluate
-    from risk.guardrails import IS_PASSTHROUGH_STUB as _GUARDRAILS_IS_STUB
 
     _GUARDRAILS_IMPORT_ERROR: Optional[BaseException] = None
 except BaseException as exc:  # pragma: no cover - exercised only on a broken gate
     _module_risk_evaluate = None
-    _GUARDRAILS_IS_STUB = True
     _GUARDRAILS_IMPORT_ERROR = exc
+
+# Calendar lookback used to estimate average daily volume and recent returns for
+# the risk gate. Wide enough to clear the gate's correlation_min_periods.
+_RISK_HISTORY_DAYS: int = 90
 
 _API_PORT_REMINDER = (
     "Could not reach TWS or IB Gateway. Confirm it is running and that the API "
@@ -117,6 +121,13 @@ class IBKRClient:
         # The risk gate, stored per-instance so tests can swap or disable it.
         self._risk_evaluate = _module_risk_evaluate
 
+        # Equity baselines for the drawdown circuit breakers. Tracked per UTC day
+        # and ISO week as a best-effort in-process snapshot; the orchestrator may
+        # override them with persisted session values via set_equity_baselines.
+        self._equity_anchors: dict[str, tuple[str, float]] = {}
+        self._forced_day_start: Optional[float] = None
+        self._forced_week_start: Optional[float] = None
+
         # Local intended state, for reconciliation against the broker.
         self._intended_positions: dict[str, float] = {}
         self._working_order_ids: list[int] = []
@@ -131,11 +142,11 @@ class IBKRClient:
         self._last_mode: str = "PAPER"
         self._last_readonly: bool = False
 
-        if _GUARDRAILS_IS_STUB:
-            self.log.warning(
-                "risk_guardrails_passthrough_stub",
-                detail="Risk gate is the stage-2 passthrough stub; real limits "
-                "are not active until stage 3.",
+        if _module_risk_evaluate is None:
+            self.log.error(
+                "risk_guardrails_import_failed",
+                detail="Risk gate failed to import; no orders can be submitted. "
+                f"Import error: {_GUARDRAILS_IMPORT_ERROR}",
             )
 
     # ----------------------------------------------------------------- connect
@@ -399,8 +410,27 @@ class IBKRClient:
 
     # ------------------------------------------------------------- risk gate
 
+    def set_equity_baselines(
+        self, day_start: Optional[float] = None, week_start: Optional[float] = None
+    ) -> None:
+        """Override the day/week start equity used by the drawdown breakers.
+
+        The orchestrator calls this at session start with persisted values so the
+        drawdown circuit breakers measure from the true period open rather than
+        the broker's first in-process observation. Either may be None to fall back
+        to the in-process snapshot for that period.
+        """
+        self._forced_day_start = day_start
+        self._forced_week_start = week_start
+
     def _evaluate_risk(self, order: Order) -> RiskDecision:
-        """Run the order through the stable risk gate. Raises if unavailable."""
+        """Run the order through the real risk gate. Raises if unavailable.
+
+        The broker assembles an AccountState from broker-reported equity and
+        positions plus data-source liquidity and returns, then hands it to the
+        gate. The gate is the only thing that can veto or shrink; the broker only
+        builds the inputs and obeys the verdict.
+        """
         if self._risk_evaluate is None:
             reason = (
                 "Risk guardrails gate is unavailable; refusing to submit any "
@@ -414,8 +444,8 @@ class IBKRClient:
             )
             raise GuardrailsUnavailableError(reason)
 
-        context = {"intended_positions": dict(self._intended_positions)}
-        decision = self._risk_evaluate(order, context)
+        account_state = self._build_account_state(order)
+        decision = self._risk_evaluate(order, account_state)
         self.audit.record(
             "RISK_DECISION",
             {
@@ -423,10 +453,142 @@ class IBKRClient:
                 "approved": decision.approved,
                 "vetoes": decision.vetoes,
                 "evaluator": decision.evaluator,
+                "equity": account_state.equity,
+                "requested_quantity": order.quantity,
+                "adjusted_quantity": decision.adjusted_quantity,
             },
             decision.reason,
         )
         return decision
+
+    # ------------------------------------------------------- account state
+
+    def _build_account_state(self, order: Order) -> AccountState:
+        """Assemble the AccountState the risk gate evaluates against.
+
+        Equity and positions come from the broker; reference price, average daily
+        volume, and recent returns come from the wired data source. This never
+        reaches into the gate's logic; it only supplies inputs.
+        """
+        equity = self._net_liquidation()
+        positions = self.positions()
+        day_start, week_start = self._equity_baselines(equity)
+
+        symbols = {order.symbol} | {p.symbol for p in positions if p.symbol}
+        prices: dict[str, float] = {}
+        adv: dict[str, float] = {}
+        returns: dict[str, list[float]] = {}
+
+        # Reference price for the order symbol: its own limit, else a live quote.
+        entry_ref = order.limit_price
+        if entry_ref is None:
+            entry_ref = self._reference_price(order.symbol)
+        if entry_ref is not None:
+            prices[order.symbol] = entry_ref
+
+        for position in positions:
+            if position.market_price is not None:
+                prices.setdefault(position.symbol, position.market_price)
+
+        for symbol in symbols:
+            volume, sym_returns = self._liquidity_and_returns(symbol)
+            if volume is not None:
+                adv[symbol] = volume
+            if sym_returns:
+                returns[symbol] = sym_returns
+
+        return AccountState(
+            equity=equity,
+            day_start_equity=day_start,
+            week_start_equity=week_start,
+            positions=positions,
+            prices=prices,
+            average_daily_volume=adv,
+            recent_returns=returns,
+        )
+
+    def _net_liquidation(self) -> float:
+        """Total net liquidation value across reported accounts (0.0 if absent)."""
+        total = 0.0
+        found = False
+        for summary in self.account_summary():
+            value = summary.get_float("NetLiquidation")
+            if value is not None:
+                total += value
+                found = True
+        return total if found else 0.0
+
+    def _equity_baselines(self, equity: float) -> tuple[Optional[float], Optional[float]]:
+        """Day and week start equity for the drawdown breakers.
+
+        Operator-supplied baselines win. Otherwise a best-effort in-process
+        snapshot is used: the first equity seen in a given UTC day (or ISO week)
+        becomes that period's start and is reused until the period rolls over.
+        """
+        if self._forced_day_start is not None or self._forced_week_start is not None:
+            return self._forced_day_start, self._forced_week_start
+
+        now = datetime.now(timezone.utc)
+        iso = now.isocalendar()
+        day = self._roll_anchor("day", now.strftime("%Y-%m-%d"), equity)
+        week = self._roll_anchor("week", f"{iso[0]}-W{iso[1]:02d}", equity)
+        return day, week
+
+    def _roll_anchor(self, period: str, key: str, equity: float) -> float:
+        anchor = self._equity_anchors.get(period)
+        if anchor is None or anchor[0] != key:
+            self._equity_anchors[period] = (key, equity)
+            return equity
+        return anchor[1]
+
+    def _reference_price(self, symbol: str) -> Optional[float]:
+        """Best available live reference price for an order with no limit price."""
+        if self._data_source is None:
+            return None
+        try:
+            quote = self._data_source.get_quote(symbol)
+        except Exception as exc:  # noqa: BLE001 - missing price must not crash sizing
+            self.log.warning("reference_price_unavailable", symbol=symbol, error=str(exc))
+            return None
+        for candidate in (quote.mid, quote.last, quote.bid, quote.ask):
+            if candidate is not None:
+                return candidate
+        return None
+
+    def _liquidity_and_returns(
+        self, symbol: str
+    ) -> tuple[Optional[float], list[float]]:
+        """Average daily volume and recent close-to-close returns for a symbol.
+
+        Returns (None, []) when no history is available; the gate then vetoes for
+        unknown liquidity rather than guessing, which is the safe default.
+        """
+        if self._data_source is None:
+            return None, []
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(days=_RISK_HISTORY_DAYS)
+        try:
+            bars = self._data_source.get_historical_bars(
+                symbol, start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d"), "1 day"
+            )
+        except Exception as exc:  # noqa: BLE001 - missing history must not crash sizing
+            self.log.warning("risk_history_unavailable", symbol=symbol, error=str(exc))
+            return None, []
+        if bars is None or len(bars) == 0:
+            return None, []
+
+        adv: Optional[float] = None
+        if "volume" in bars.columns:
+            volume = bars["volume"].dropna()
+            if len(volume) > 0:
+                adv = float(volume.mean())
+
+        returns: list[float] = []
+        if "close" in bars.columns:
+            change = bars["close"].pct_change().dropna()
+            returns = [float(x) for x in change.tolist()]
+
+        return adv, returns
 
     # -------------------------------------------------------- order placement
 
