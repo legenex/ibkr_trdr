@@ -1,18 +1,23 @@
 import type { ReactNode } from "react";
 import { NavLink } from "react-router-dom";
+import { useLiveStore } from "../lib/store";
 
+// The eight console pages, in the order of the design mockup's nav rail.
 const NAV = [
-  { to: "/", label: "Command", end: true, ready: true },
-  { to: "/approvals", label: "Approvals", ready: false },
-  { to: "/positions", label: "Positions", ready: false },
-  { to: "/backtests", label: "Backtests", ready: false },
-  { to: "/audit", label: "Audit", ready: false },
-  { to: "/skills", label: "Skills", ready: false },
-  { to: "/learning", label: "Learning", ready: false },
-  { to: "/holdout", label: "Holdout", ready: false },
+  { to: "/", label: "Command", end: true },
+  { to: "/portfolio", label: "Portfolio" },
+  { to: "/trades", label: "Trades" },
+  { to: "/research", label: "Research & Approvals" },
+  { to: "/strategies", label: "Strategies" },
+  { to: "/learning", label: "Learning" },
+  { to: "/settings", label: "Settings" },
+  { to: "/audit", label: "Audit" },
 ];
 
 export function AppShell({ header, children }: { header: ReactNode; children: ReactNode }) {
+  const mode = useLiveStore((s) => s.snapshot?.mode ?? "PAPER");
+  const engaged = useLiveStore((s) => s.snapshot?.kill_switch.engaged ?? false);
+
   return (
     <div className="app">
       <nav className="nav" aria-label="Primary">
@@ -32,9 +37,12 @@ export function AppShell({ header, children }: { header: ReactNode; children: Re
           >
             <span className="nav-dot" />
             {item.label}
-            {!item.ready && <span className="nav-soon">soon</span>}
           </NavLink>
         ))}
+        <div style={{ flex: 1 }} />
+        <div className="brand-sub" style={{ padding: "8px 11px" }}>
+          {mode.toLowerCase()} · {engaged ? "halted" : "armed"}
+        </div>
       </nav>
       <div className="main">
         {header}

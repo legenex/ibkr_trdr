@@ -31,11 +31,16 @@ from .auth import require_token
 from .schemas import (
     RISK_LIMIT_FIELDS,
     ApproveRequest,
+    ConfigUpdateRequest,
+    ConnectionTestRequest,
     DemoteRequest,
     FlattenRequest,
     KillSwitchRequest,
+    LiveEnableRequest,
     PromoteRequest,
     RejectRequest,
+    ResearchRunRequest,
+    SecretUpdateRequest,
     SettingsUpdateRequest,
     StrategyToggleRequest,
 )
@@ -51,6 +56,11 @@ def _state(request: Request) -> ApiState:
 def _approval_error(exc: ApprovalError) -> HTTPException:
     code = status.HTTP_404_NOT_FOUND if "unknown" in str(exc).lower() else status.HTTP_409_CONFLICT
     return HTTPException(status_code=code, detail=str(exc))
+
+
+def _validation_detail(exc: ValidationError) -> list[dict[str, Any]]:
+    """JSON-safe field errors (pydantic's raw ctx can hold non-serializable objects)."""
+    return [{"field": ".".join(str(p) for p in e["loc"]), "msg": e["msg"]} for e in exc.errors()]
 
 
 # ----------------------------------------------------------------- kill switch
@@ -202,7 +212,7 @@ async def save_settings(req: SettingsUpdateRequest, request: Request) -> dict[st
     try:
         candidate = Settings(_env_file=None, **merged)
     except ValidationError as exc:
-        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=exc.errors())
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=_validation_detail(exc))
 
     changes: dict[str, Any] = {}
     for field in req.values:
@@ -225,6 +235,72 @@ async def save_settings(req: SettingsUpdateRequest, request: Request) -> dict[st
         "risk_limits": {field: getattr(s, field) for field in RISK_LIMIT_FIELDS},
         "changed": changes,
     }
+
+
+@router.post("/settings/config")
+async def save_config(req: ConfigUpdateRequest, request: Request) -> dict[str, Any]:
+    """Persist non-risk operational settings (connection, trading, bot). Audited."""
+    state = _state(request)
+    try:
+        changed = state.update_config(req.values, who=req.who)
+    except ValidationError as exc:
+        # ValidationError subclasses ValueError, so it must be caught first.
+        raise HTTPException(status_code=status.HTTP_422_UNPROCESSABLE_CONTENT, detail=_validation_detail(exc))
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    state.bus.publish("settings", {"changed": list(changed.keys())})
+    return {"changed": changed}
+
+
+@router.post("/settings/secrets")
+async def save_secrets(req: SecretUpdateRequest, request: Request) -> dict[str, Any]:
+    """Write-only secret update. Values are persisted but never echoed back."""
+    state = _state(request)
+    result = state.update_secrets(
+        {"anthropic_api_key": req.anthropic_api_key, "polygon_api_key": req.polygon_api_key},
+        who=req.who,
+    )
+    state.bus.publish("settings", {"secrets": result["updated"]})
+    return result
+
+
+@router.post("/settings/live")
+async def set_live(req: LiveEnableRequest, request: Request) -> dict[str, Any]:
+    """Two-step LIVE_TRADING toggle. Enabling requires the typed confirmation."""
+    state = _state(request)
+    result = state.set_live(req.enable, req.confirmation, who=req.who)
+    state.bus.publish("settings", {"live_trading": result["live_trading"]})
+    return result
+
+
+@router.post("/connection/test")
+async def connection_test(req: ConnectionTestRequest, request: Request) -> dict[str, Any]:
+    """Attempt to reach the broker once and report status. Audited."""
+    return _state(request).test_connection(who=req.who)
+
+
+# -------------------------------------------------------------------- research
+
+
+@router.post("/research/run")
+async def run_research(req: ResearchRunRequest, request: Request) -> dict[str, Any]:
+    """Kick off one discovery pipeline run in the background.
+
+    The pipeline only proposes: it enqueues proposals for human approval and
+    audits every step. It never executes an order. Returns 202-style status. A
+    run already in flight is reported as busy rather than starting a second.
+    """
+    state = _state(request)
+    symbols = req.symbols or state.settings.watchlist_symbols
+    started = state.start_research(req.theme, symbols)
+    state.audit.record(
+        "RESEARCH_RUN_REQUESTED",
+        {"theme": req.theme, "symbols": symbols, "started": started},
+        f"Discovery run requested for '{req.theme}'"
+        + ("" if started else " (a run is already in flight)"),
+    )
+    return {"accepted": started, "running": state.research_running, "theme": req.theme,
+            "symbols": symbols}
 
 
 # --------------------------------------------------------------------- flatten
@@ -259,27 +335,7 @@ async def flatten(req: FlattenRequest, request: Request) -> dict[str, Any]:
 
 
 def _persist_env(env_path: Path, updates: dict[str, str]) -> None:
-    """Upsert KEY=VALUE lines into the .env file the backend loads at startup.
+    """Upsert KEY=VALUE lines into the .env file the backend loads at startup."""
+    from .env_writer import upsert_env
 
-    Existing keys are replaced in place; missing keys are appended. Comments and
-    unrelated keys are preserved. This makes a saved risk limit durable across
-    restarts (the config the backend enforces).
-    """
-    env_path = Path(env_path)
-    lines: list[str] = []
-    if env_path.exists():
-        lines = env_path.read_text(encoding="utf-8").splitlines()
-    remaining = dict(updates)
-    out: list[str] = []
-    for line in lines:
-        stripped = line.strip()
-        if stripped and not stripped.startswith("#") and "=" in stripped:
-            key = stripped.split("=", 1)[0].strip().upper()
-            if key in remaining:
-                out.append(f"{key}={remaining.pop(key)}")
-                continue
-        out.append(line)
-    for key, value in remaining.items():
-        out.append(f"{key}={value}")
-    env_path.parent.mkdir(parents=True, exist_ok=True)
-    env_path.write_text("\n".join(out) + "\n", encoding="utf-8")
+    upsert_env(env_path, updates)

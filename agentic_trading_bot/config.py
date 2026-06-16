@@ -109,6 +109,8 @@ class Settings(BaseSettings):
     learning_cadence: str = Field(default="off")
     learning_after_n_trades: int = Field(default=5, ge=1)
     learning_interval_minutes: int = Field(default=1440, ge=1)
+    # Times a holdout tranche may be evaluated before it is burned and rotated.
+    holdout_max_evaluations: int = Field(default=3, ge=1)
     # Reward-to-risk multiple for orchestrator-built bracket targets.
     bracket_reward_risk: float = Field(default=2.0, gt=0)
 

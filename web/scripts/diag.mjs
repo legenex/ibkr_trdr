@@ -1,0 +1,12 @@
+import { chromium } from "playwright";
+const b = await chromium.launch();
+const p = await b.newContext({ viewport:{width:1480,height:940}, colorScheme:"dark" }).then(c=>c.newPage());
+const errs=[];
+p.on("console", m => { if(m.type()==="error") errs.push(m.text()); });
+p.on("pageerror", e => errs.push("PAGEERROR: "+e.message));
+await p.goto("http://localhost:5174/research", { waitUntil:"networkidle", timeout:30000 }).catch(()=>{});
+await p.waitForTimeout(1500);
+const txt = (await p.locator("body").innerText().catch(()=>"")).slice(0,200);
+console.log("BODYTEXT:", JSON.stringify(txt));
+console.log("ERRORS:\n"+errs.slice(0,8).join("\n"));
+await b.close();

@@ -1,56 +1,85 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { Routes, Route, useLocation } from "react-router-dom";
 import { AnimatePresence, motion, useReducedMotion } from "framer-motion";
 
 import { AppShell } from "./components/AppShell";
-import { KillSwitch } from "./components/KillSwitch";
-import { Command } from "./pages/Command";
-import { Stub } from "./pages/Stub";
-import { usePolling } from "./hooks/usePolling";
+import { StatusStrip } from "./components/StatusStrip";
+import { useLiveConnection } from "./hooks/useLive";
+import { useResource } from "./hooks/useResource";
+import { useLiveStore } from "./lib/store";
 import { getCommand, setKillSwitch } from "./lib/api";
 import { pageVariants, pageTransition } from "./lib/motion";
-import type { CommandSnapshot } from "./lib/types";
+
+import { Command } from "./pages/Command";
+import { Portfolio } from "./pages/Portfolio";
+import { Trades } from "./pages/Trades";
+import { Research } from "./pages/Research";
+import { Strategies } from "./pages/Strategies";
+import { Learning } from "./pages/Learning";
+import { Settings } from "./pages/Settings";
+import { Audit } from "./pages/Audit";
+import { Stub } from "./pages/Stub";
 
 export default function App() {
   const location = useLocation();
   const reduce = useReducedMotion();
-  const { data, error } = usePolling<CommandSnapshot>(getCommand, 4000);
+
+  // Live channel feeds the store; a slow command poll is the resilient baseline.
+  useLiveConnection();
+  const setSnapshot = useLiveStore((s) => s.setSnapshot);
+  const wsStatus = useLiveStore((s) => s.wsStatus);
+  const engaged = useLiveStore((s) => s.snapshot?.kill_switch.engaged ?? false);
+  const { data: command, error } = useResource(getCommand, { intervalMs: 5000 });
+  useEffect(() => {
+    // While the WebSocket is down, the poll keeps the store fresh.
+    if (command && wsStatus !== "open") setSnapshot(command);
+  }, [command, wsStatus, setSnapshot]);
+  useEffect(() => {
+    // Seed the store immediately on first load regardless of ws state.
+    if (command) setSnapshot(command);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [command?.ts_utc]);
+
   const [killBusy, setKillBusy] = useState(false);
-  const [killOverride, setKillOverride] = useState<boolean | null>(null);
-
-  const engaged = killOverride ?? data?.kill_switch.engaged ?? false;
-  const mode = data?.mode ?? "PAPER";
-
-  const onToggle = useCallback(async (next: boolean) => {
-    setKillBusy(true);
-    setKillOverride(next); // optimistic; the next poll reconciles
-    try {
-      const res = await setKillSwitch(next);
-      setKillOverride(res.engaged);
-    } catch {
-      setKillOverride(null);
-    } finally {
-      setKillBusy(false);
-    }
-  }, []);
-
-  const header = (
-    <header className="header">
-      <div className="header-title">
-        <span className="eyebrow">Agentic Trading</span>
-        <span className="display" style={{ fontSize: 14 }}>Operations</span>
-      </div>
-      <div className="header-spacer" />
-      <span className={`chip ${mode === "LIVE" ? "live" : "paper"}`}>
-        <span className="dot" />
-        {mode}
-      </span>
-      <KillSwitch engaged={engaged} onToggle={onToggle} busy={killBusy} />
-    </header>
+  const onToggleKill = useCallback(
+    async (next: boolean) => {
+      setKillBusy(true);
+      try {
+        const res = await setKillSwitch(next);
+        useLiveStore.getState().patchSnapshot({ kill_switch: { engaged: res.engaged } });
+      } catch {
+        /* the next poll reconciles */
+      } finally {
+        setKillBusy(false);
+      }
+    },
+    [],
   );
 
   return (
-    <AppShell header={header}>
+    <AppShell header={<StatusStrip onToggleKill={onToggleKill} killBusy={killBusy} />}>
+      {engaged && (
+        <div className="banner-halt" style={{ marginBottom: "var(--gutter)" }}>
+          <span className="kdot" style={{ background: "var(--short)" }} />
+          <span>
+            <b>Kill switch engaged.</b> New order submission is halted across the harness. Flatten is
+            a separate, confirmed action.
+          </span>
+        </div>
+      )}
+      {error && wsStatus !== "open" && (
+        <div className="banner-error" style={{ marginBottom: "var(--gutter)" }}>
+          <div className="display" style={{ marginBottom: 6 }}>
+            Cannot reach the API
+          </div>
+          <div className="muted" style={{ marginBottom: 8 }}>
+            {error}
+          </div>
+          <code className="empty-cmd">
+            cd agentic_trading_bot && uvicorn api.server:app --port 8000
+          </code>
+        </div>
+      )}
       <AnimatePresence mode="wait">
         <motion.div
           key={location.pathname}
@@ -61,14 +90,14 @@ export default function App() {
           transition={reduce ? { duration: 0 } : pageTransition}
         >
           <Routes location={location}>
-            <Route path="/" element={<Command snap={data} error={error} />} />
-            <Route path="/approvals" element={<Stub name="Approvals" />} />
-            <Route path="/positions" element={<Stub name="Positions" />} />
-            <Route path="/backtests" element={<Stub name="Backtests" />} />
-            <Route path="/audit" element={<Stub name="Audit" />} />
-            <Route path="/skills" element={<Stub name="Skill Registry" />} />
-            <Route path="/learning" element={<Stub name="Learning History" />} />
-            <Route path="/holdout" element={<Stub name="Holdout Budget" />} />
+            <Route path="/" element={<Command />} />
+            <Route path="/portfolio" element={<Portfolio />} />
+            <Route path="/trades" element={<Trades />} />
+            <Route path="/research" element={<Research />} />
+            <Route path="/strategies" element={<Strategies />} />
+            <Route path="/learning" element={<Learning />} />
+            <Route path="/settings" element={<Settings />} />
+            <Route path="/audit" element={<Audit />} />
             <Route path="*" element={<Stub name="Not Found" />} />
           </Routes>
         </motion.div>

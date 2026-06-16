@@ -87,6 +87,7 @@ def _emit_deltas(state: ApiState, last: dict[str, Any]) -> None:
         state.bus.publish("audit", {"activity": state.activity(limit=10)})
 
     portfolio = state.portfolio()
+    state.record_equity_sample()
     fingerprint = (
         portfolio.get("net_liquidation"),
         portfolio.get("open_positions"),

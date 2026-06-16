@@ -64,7 +64,7 @@ The system reflects on its own outcomes, proposes small improvements as reusable
 - Orchestration and agents: the Claude Agent SDK (pip install claude-agent-sdk, Python 3.10+, bundles the Claude Code CLI). No heavy multi-agent framework. The three agents are plain async functions wired by a thin custom pipeline. Use ClaudeSDKClient for agents that need tools, MCP, and hooks; use query() for simple structured generations. Approval is decoupled from execution through the queue table, so no durable graph interrupt or resume is needed. Keep all LLM calls behind a thin provider interface so a non-Claude model can be swapped in for any single agent. Note: as of June 15 2026, Agent SDK usage on subscription plans draws from a separate monthly Agent SDK credit, so meter agent invocations.
 - Data and ML: pandas, numpy, scikit-learn, hmmlearn, statsmodels, scipy, pandas_ta (prefer this over TA-Lib to avoid a C build dependency, unless TA-Lib is explicitly wanted).
 - Backtesting: an event-driven engine (custom) with the mandatory cost model, or vectorbt if vectorized is acceptable for a given strategy. The cost model is not optional.
-- UI: Streamlit, dark mode, with tabs and a visible kill switch.
+- UI: a React and TypeScript operator console (web/, built with Vite and Tailwind) talking to a FastAPI service (agentic_trading_bot/api/). A Streamlit dashboard (agentic_trading_bot/ui/) remains as a lightweight operator view. Dark mode, with a visible kill switch.
 - Infra: APScheduler for scheduling, pydantic for config and message schemas, python-dotenv for secrets, loguru or structlog for logging, plotly for charts.
 - Data fallback: yfinance or polygon as a backup to IBKR historical data, behind a common data interface so the source is swappable.
 - Learning storage: a separate SQLite db (journal/learning.db) for skills, reflections, hypotheses, experiments, the trial ledger, and the holdout budget. The append-only audit db stays as is. Skill and reflection retrieval is a structured query first (filter by type, regime, recency, rank by live performance). Embeddings or a vector index are an optional later enhancement, not a launch dependency.
@@ -81,9 +81,10 @@ The system reflects on its own outcomes, proposes small improvements as reusable
 - Each module ships with its own pytest tests.
 
 ## Project layout
-agentic_trading_bot/
+agentic_trading_bot/         the Python backend (harness)
   main.py                  orchestrator and scheduler
   config.py                typed config loaded from .env
+  pyproject.toml
   core/contracts.py        ALL cross-module pydantic models (the parallel-safe interface)
   .env.example
   requirements.txt
@@ -94,13 +95,28 @@ agentic_trading_bot/
   broker/ibkr_client.py    ib_async wrapper, paper and live toggle
   data/                    data interface, IBKR and fallback sources, caching
   backtest/validator.py    backtest engine and the validation gate
-  discovery/research_pipeline.py   the thin async pipeline wiring the agents
-  learning/                skills registry, trial ledger, holdout budget, experiment runner
-  ui/dashboard.py          streamlit app
+  discovery/               research_pipeline.py (agent wiring) and approval_queue.py (decoupled approval)
+  learning/                skills registry, trial ledger, holdout budget, experiment store, budget meter
+  api/                     FastAPI service for the web console (thin layer over the modules)
+    server.py              create_app factory: localhost bind, shared-token gate, lifespan poller
+    auth.py                shared-token check
+    state.py               shared handles, read producers, and snapshot builders
+    events.py              in-process pub/sub bus feeding the websocket
+    schemas.py             request bodies for the action endpoints
+    routes_read.py         read (GET) endpoints
+    routes_actions.py      gated action (POST) endpoints, each routed through an existing gated path
+    ws.py                  websocket channel and background poller
+  ui/                      Streamlit operator dashboard (dashboard.py) and its pure logic (dashboard_helpers.py)
   utils/logging.py
   utils/audit.py           append-only audit trail
   journal/                 logs, approved strategies, audit db, learning db
+  testsupport/             test fakes (fake ib_async IB) shared across tests
   tests/
+
+web/                         the operator console (Vite, React, TypeScript, Tailwind)
+  index.html, vite.config.ts, package.json, tsconfig.json, .env.example
+  src/                     app shell, pages, components, hooks, lib, styles
+  design/command_console_mockup.html   the Command-page mockup, visual source of truth for the console
 
 ## Build order and tracks
 Stage 1 is the foundation and runs first and alone. After it, Track A and Track B are independent and may be built in parallel in separate worktrees. They converge at the UI.
@@ -116,7 +132,7 @@ Track B (research and validation):
 7 agentic discovery, Claude Agent SDK, decoupled approval           (depends on 5 and 6)
 7.5 self-learning loop: reflection, skills, experiments, meta-review (depends on 5, 6, 7)
 Convergence:
-8 streamlit UI                                                      (depends on 2, 3, 4, 5, 7, 7.5, M1)
+8 operator console: FastAPI service (api/) and the web/ React app, plus the Streamlit dashboard (ui/)   (depends on 2, 3, 4, 5, 7, 7.5, M1)
 9 orchestrator, main loop, scheduler, learning loop, end to end     (depends on everything)
 A stage may assume only the modules listed in its dependencies exist. Code against core/contracts.py for anything from a stage you do not depend on.
 

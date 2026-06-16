@@ -58,6 +58,22 @@ def regime(request: Request) -> dict[str, Any]:
     return _state(request).regime()
 
 
+@router.get("/equity-curve")
+def equity_curve(request: Request) -> dict[str, Any]:
+    """In-session net-liquidation samples for the equity curve chart."""
+    return _state(request).equity_curve()
+
+
+@router.get("/bars/{symbol}")
+def bars(
+    request: Request,
+    symbol: str,
+    lookback_days: int = Query(default=180, ge=5, le=2000),
+) -> dict[str, Any]:
+    """Daily OHLC bars for a symbol (for the lightweight-charts price chart)."""
+    return _state(request).bars(symbol, lookback_days)
+
+
 # ------------------------------------------------------------------ research
 
 
@@ -207,19 +223,43 @@ def audit_log(
 
 @router.get("/settings")
 def settings_view(request: Request) -> dict[str, Any]:
-    """Current settings the backend enforces (secrets redacted)."""
+    """Current settings the backend enforces, grouped by panel (secrets redacted)."""
     s = _state(request).settings
     risk = {field: getattr(s, field) for field in RISK_LIMIT_FIELDS}
     return {
         "mode": "LIVE" if s.live_trading else "PAPER",
         "live_trading": s.live_trading,
-        "use_ib_gateway": s.use_ib_gateway,
-        "ibkr_host": s.ibkr_host,
-        "trading_port": s.resolved_trading_port(),
-        "watchlist": s.watchlist_symbols,
-        "regime_proxy_symbol": s.regime_proxy_symbol,
-        "risk_limits": risk,
         "kill_switch_engaged": s.kill_switch_path.exists(),
+        # The confirmation phrase is a deliberate-typing friction, not a secret.
+        "live_confirmation_phrase": s.live_confirmation_phrase,
+        "connection": {
+            "ibkr_host": s.ibkr_host,
+            "ibkr_client_id": s.ibkr_client_id,
+            "use_ib_gateway": s.use_ib_gateway,
+            "ibkr_paper_port": s.ibkr_paper_port,
+            "ibkr_live_port": s.ibkr_live_port,
+            "ibkr_gateway_paper_port": s.ibkr_gateway_paper_port,
+            "ibkr_gateway_live_port": s.ibkr_gateway_live_port,
+            "trading_port": s.resolved_trading_port(),
+        },
+        "risk_limits": risk,
+        "trading": {
+            "watchlist": s.watchlist,
+            "regime_proxy_symbol": s.regime_proxy_symbol,
+            "bracket_reward_risk": s.bracket_reward_risk,
+            "trading_interval_seconds": s.trading_interval_seconds,
+        },
+        "bot": {
+            "discovery_enabled": s.discovery_enabled,
+            "discovery_interval_minutes": s.discovery_interval_minutes,
+            "discovery_theme": s.discovery_theme,
+            "learning_cadence": s.learning_cadence,
+            "learning_after_n_trades": s.learning_after_n_trades,
+            "learning_interval_minutes": s.learning_interval_minutes,
+            "learning_token_budget": s.learning_token_budget,
+            "learning_cost_budget_usd": s.learning_cost_budget_usd,
+            "holdout_max_evaluations": s.holdout_max_evaluations,
+        },
         # Secrets are never returned, only whether they are configured.
         "secrets_present": {
             "anthropic_api_key": s.anthropic_api_key is not None,

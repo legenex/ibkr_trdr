@@ -8,7 +8,7 @@ path.
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
@@ -90,4 +90,40 @@ class FlattenRequest(BaseModel):
 
     symbol: str = Field(min_length=1)
     confirm: bool = False
+    who: str = Field(default="web-ui")
+
+
+class ResearchRunRequest(BaseModel):
+    """Kick off one discovery pipeline run. The pipeline only proposes."""
+
+    theme: str = Field(min_length=1)
+    symbols: Optional[list[str]] = None
+
+
+class ConfigUpdateRequest(BaseModel):
+    """Persist non-risk operational settings (connection, trading, bot)."""
+
+    values: dict[str, Any]
+    who: str = Field(default="web-ui")
+
+
+class SecretUpdateRequest(BaseModel):
+    """Write-only secret update. Blank fields are ignored; values never echoed."""
+
+    anthropic_api_key: Optional[str] = None
+    polygon_api_key: Optional[str] = None
+    who: str = Field(default="web-ui")
+
+
+class LiveEnableRequest(BaseModel):
+    """Two-step LIVE_TRADING toggle. Enabling requires the typed phrase."""
+
+    enable: bool
+    confirmation: str = Field(default="")
+    who: str = Field(default="web-ui")
+
+
+class ConnectionTestRequest(BaseModel):
+    """Trigger a one-shot broker connection test."""
+
     who: str = Field(default="web-ui")

@@ -3,34 +3,36 @@ import { Eyebrow } from "./Primitives";
 import { RegimeDial } from "./RegimeDial";
 import { Meter } from "./Meter";
 import { AnimatedNumber } from "./AnimatedNumber";
-import { fmtSignedMoney, fmtPct } from "../lib/format";
+import { fmtMoney, fmtPct } from "../lib/format";
 
 // The one bold place: the flight-deck instrument cluster. Regime dial at the
-// center, the risk meters and P&L beside it, the kill / breaker state below.
+// center, the risk meters and net liquidation beside it, the kill / breaker
+// state below.
 export function InstrumentCluster({ snap }: { snap: CommandSnapshot }) {
   const { regime, risk, portfolio, circuit_breaker, kill_switch } = snap;
-  const pnl = portfolio.pnl_day ?? 0;
 
   return (
     <div className="cluster" aria-label="Instrument cluster">
       <div className="cluster-left">
         <Eyebrow>Detected Regime</Eyebrow>
-        <RegimeDial label={regime.label} confidence={regime.confidence} available={regime.available} />
-        <div className="cluster-regime">{regime.available ? regime.label : "Unavailable"}</div>
+        <RegimeDial label={regime.regime} confidence={regime.confidence} available={regime.available} />
+        <div className="cluster-regime">{regime.available ? regime.regime : "Unavailable"}</div>
         <div className="cluster-conf">proxy {regime.proxy}</div>
       </div>
 
       <div className="cluster-right">
         <div>
-          <Eyebrow>Day P&amp;L</Eyebrow>
+          <Eyebrow>Net Liquidation</Eyebrow>
           <div className="stat-value">
             {portfolio.connected ? (
-              <AnimatedNumber value={pnl} format={fmtSignedMoney} polarity="profit" />
+              <AnimatedNumber value={portfolio.net_liquidation ?? 0} format={fmtMoney} polarity="neutral" />
             ) : (
-              <span className="mono muted">—</span>
+              <span className="mono muted">offline</span>
             )}
           </div>
-          <div className="stat-sub">{portfolio.connected ? `${portfolio.open_positions} open positions` : "broker offline"}</div>
+          <div className="stat-sub">
+            {portfolio.connected ? `${portfolio.open_positions} open positions` : "broker offline"}
+          </div>
         </div>
 
         <div>

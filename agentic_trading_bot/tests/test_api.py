@@ -352,6 +352,73 @@ def test_save_settings_audits_change_and_persists(ctx):
     assert "RISK_PER_TRADE_PCT=1.0" in ctx.env_path.read_text()
 
 
+def test_save_config_persists_and_audits(ctx):
+    resp = ctx.client.post(
+        "/api/settings/config",
+        json={"values": {"ibkr_host": "10.0.0.9", "learning_cadence": "daily"}},
+        headers=AUTH,
+    )
+    assert resp.status_code == 200
+    assert ctx.settings.ibkr_host == "10.0.0.9"
+    assert ctx.settings.learning_cadence == "daily"
+    assert "SETTING_CHANGED" in _audit_types(ctx.state)
+    assert "IBKR_HOST=10.0.0.9" in ctx.env_path.read_text()
+
+
+def test_save_config_rejects_unknown_and_invalid(ctx):
+    assert ctx.client.post("/api/settings/config", json={"values": {"nope": 1}},
+                           headers=AUTH).status_code == 400
+    assert ctx.client.post("/api/settings/config",
+                           json={"values": {"learning_cadence": "sometimes"}},
+                           headers=AUTH).status_code == 422
+
+
+def test_secrets_are_write_only(ctx):
+    resp = ctx.client.post("/api/settings/secrets",
+                           json={"anthropic_api_key": "sk-secret-123"}, headers=AUTH)
+    assert resp.status_code == 200
+    assert "anthropic_api_key" in resp.json()["updated"]
+    assert "sk-secret-123" not in str(resp.json())  # never echoed
+    assert "SECRET_UPDATED" in _audit_types(ctx.state)
+    view = ctx.client.get("/api/settings", headers=AUTH).json()
+    assert view["secrets_present"]["anthropic_api_key"] is True
+    assert "sk-secret-123" not in str(view)
+
+
+def test_live_enable_requires_both_steps(ctx):
+    # Wrong phrase -> refused and audited; flag stays False.
+    bad = ctx.client.post("/api/settings/live",
+                          json={"enable": True, "confirmation": "wrong"}, headers=AUTH)
+    assert bad.json()["accepted"] is False and bad.json()["live_trading"] is False
+    assert "LIVE_ENABLE_DENIED" in _audit_types(ctx.state)
+    assert ctx.settings.live_trading is False
+
+    # Correct phrase -> flag set, audited.
+    good = ctx.client.post(
+        "/api/settings/live",
+        json={"enable": True, "confirmation": ctx.settings.live_confirmation_phrase},
+        headers=AUTH,
+    )
+    assert good.json()["accepted"] is True and good.json()["live_trading"] is True
+    assert "LIVE_ENABLED" in _audit_types(ctx.state)
+    # Disabling is one step.
+    off = ctx.client.post("/api/settings/live", json={"enable": False}, headers=AUTH)
+    assert off.json()["live_trading"] is False
+
+
+def test_connection_test_reports_and_audits(ctx):
+    body = ctx.client.post("/api/connection/test", json={}, headers=AUTH).json()
+    assert body["ok"] is True  # the fake broker connects
+    assert "CONNECTION_TEST" in _audit_types(ctx.state)
+
+
+def test_settings_view_is_grouped(ctx):
+    body = ctx.client.get("/api/settings", headers=AUTH).json()
+    for key in ("connection", "risk_limits", "trading", "bot", "secrets_present",
+                "live_confirmation_phrase"):
+        assert key in body
+
+
 def test_save_settings_rejects_unknown_field(ctx):
     resp = ctx.client.post("/api/settings",
                            json={"values": {"not_a_limit": 1.0}}, headers=AUTH)
@@ -371,9 +438,28 @@ def test_save_settings_rejects_out_of_range(ctx):
 def test_read_endpoints_smoke(ctx):
     for path in ("/api/account", "/api/positions", "/api/trades", "/api/regime",
                  "/api/proposals", "/api/strategies", "/api/skills", "/api/learning",
-                 "/api/holdout", "/api/audit", "/api/settings", "/api/command"):
+                 "/api/holdout", "/api/audit", "/api/settings", "/api/command",
+                 "/api/equity-curve"):
         resp = ctx.client.get(path, headers=AUTH)
         assert resp.status_code == 200, f"{path} -> {resp.status_code}"
+
+
+def test_bars_endpoint(ctx, monkeypatch):
+    # Avoid a real network fetch; the route is a thin pass-through.
+    monkeypatch.setattr(ctx.state, "bars",
+                        lambda symbol, lookback_days=180: {"available": True, "symbol": symbol,
+                                                           "bars": [{"time": "2026-01-02", "close": 1.0}]})
+    body = ctx.client.get("/api/bars/AAPL", headers=AUTH).json()
+    assert body["symbol"] == "AAPL" and body["available"] is True
+
+
+def test_research_run_is_proposal_only_and_audited(ctx, monkeypatch):
+    # Stub the heavy pipeline launch; assert the route accepts and audits.
+    monkeypatch.setattr(ctx.state, "start_research", lambda theme, symbols: True)
+    resp = ctx.client.post("/api/research/run", json={"theme": "momentum"}, headers=AUTH)
+    assert resp.status_code == 200
+    assert resp.json()["accepted"] is True
+    assert "RESEARCH_RUN_REQUESTED" in _audit_types(ctx.state)
 
 
 def test_proposals_endpoint_carries_full_validation(ctx):
