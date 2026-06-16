@@ -12,7 +12,7 @@ All code lives under `agentic_trading_bot/`. Run commands from there.
 cd agentic_trading_bot
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-pytest -q          # 159 tests should pass
+pytest -q          # 196 tests should pass
 ```
 
 ---
@@ -48,6 +48,9 @@ Edit `.env`:
 - Keep `LIVE_TRADING=false` (the default; do not change it yet).
 - Set `IBKR_PAPER_PORT` to match your app (`7497` TWS, or `4002` with
   `USE_IB_GATEWAY=true`).
+- Set `API_TOKEN` to a value of your choice. The console must send it on every
+  request; if you leave it unset the server generates an ephemeral token and
+  logs it once at startup.
 - Optionally set `ANTHROPIC_API_KEY` to use the live Claude Agent SDK for
   research; without it the discovery pipeline runs an offline stub and the
   **validation gate still runs for real**.
@@ -57,21 +60,64 @@ Edit `.env`:
 
 Secrets live only in `.env`, which is gitignored. Never commit it.
 
-### 3. Launch the dashboard (UI)
+### 3. Launch the harness (orchestrator + API together)
+
+One command brings up the trading orchestrator **and** the FastAPI service the
+console reads from:
 
 ```
 cd agentic_trading_bot
-streamlit run ui/dashboard.py
+python -m main
 ```
 
-Open `http://localhost:8501`. It opens in dark mode with an always-visible
-**KILL SWITCH** at the top and a green **PAPER** indicator in the sidebar.
-- Connect the broker on the **Positions & Orders** tab (it connects to the paper
-  port). If it cannot reach TWS/Gateway it tells you to enable the API port.
-- The **Dashboard** tab shows the current regime and, once connected, the
-  portfolio and circuit-breaker status.
+This:
+- connects the broker to the **paper** port on a dedicated worker thread (no
+  runtime confirmation is passed, so invariant 1 keeps it on paper),
+- starts the APScheduler trading loop (default every 60s),
+- serves the read/action API and the live WebSocket on `127.0.0.1:8000`.
 
-### 4. Get a strategy into the approval queue
+The API only reads shared state and forwards intent; it never drives the trading
+cycle. The kill switch written from the console is the **same sentinel file** the
+loop checks first every cycle.
+
+Variants:
+- `python -m main --no-api` runs the orchestrator scheduler alone.
+- `python -m main --api-only` (or `uvicorn api.server:app --port 8000`) runs the
+  API alone, for when the orchestrator runs as a separate sibling process. Run as
+  siblings they share the same journal and learning databases and the kill-switch
+  file; give the API process a different `IBKR_CLIENT_ID` so both can connect.
+
+### 4. Open the operator console (frontend)
+
+The console is a Vite + React app in `web/` that talks to the API from step 3.
+
+```
+cd web
+cp .env.example .env          # set VITE_API_TOKEN to the SAME value as API_TOKEN
+npm install
+npm run dev                   # http://localhost:5173, proxies /api and /ws to :8000
+```
+
+Open `http://localhost:5173`. It opens in dark mode with the **Command** page as
+the hero: detected regime, risk meters, circuit-breaker and kill-switch state,
+the approval queue, and a live activity feed. A green **PAPER** badge and an
+always-reachable kill switch sit in the status strip.
+
+For a deployed, single-origin setup, build the static bundle and serve it behind
+the same API host instead of running the dev server:
+
+```
+cd web && npm run build       # emits web/dist
+```
+
+A lightweight **Streamlit** operator view also remains, if you want a
+no-frontend-build option:
+
+```
+cd agentic_trading_bot && streamlit run ui/dashboard.py   # http://localhost:8501
+```
+
+### 5. Get a strategy into the approval queue
 
 Either:
 - **Research Chat** tab: enter a theme and a small universe, click **Run
@@ -82,9 +128,9 @@ Either:
 Reference strategies are honest test subjects, not claimed edges, so most
 candidates will (correctly) **FAIL** the validation gate.
 
-### 5. Approve a strategy (PAPER only)
+### 6. Approve a strategy (PAPER only)
 
-On the **Signals & Approvals** tab, open a pending proposal. You see its full
+On the **Research & Approvals** page, open a pending proposal. You see its full
 `ValidationResult`: gross and net metrics, deflated Sharpe, walk-forward
 distribution, sensitivity, and regime breakdown.
 - **Approve is disabled when the proposal FAILED**, with the failing reasons
@@ -93,30 +139,25 @@ distribution, sensitivity, and regime breakdown.
   **paper execution only**. The approval and a risk warning are written to the
   audit trail.
 
-### 6. Run the orchestrator and watch a paper bracket order
+### 7. Watch a paper bracket order land
 
-Start the scheduler (separate terminal, same venv):
-
-```
-cd agentic_trading_bot
-python -m main
-```
-
-Each cycle (default 60s) the orchestrator:
-1. checks the kill switch and circuit breakers first,
-2. refreshes the regime,
+The orchestrator started in step 3 is already running. Each cycle (default 60s)
+it:
+1. checks the kill switch and circuit breakers first, before anything else,
+2. refreshes the detected regime,
 3. for each **approved** strategy generates a signal, sizes it through the risk
    gate, and submits a **bracket order** (entry, protective stop, target) on the
    paper account,
 4. reconciles against IBKR and logs any drift,
 5. writes a per-cycle summary to the audit trail.
 
-Watch it land: the order appears in TWS/Gateway and on the **Positions &
-Orders** tab; the **Audit** tab shows `CYCLE_SUMMARY`, `RISK_DECISION`, and
-`ORDER_SUBMITTED` events. Every entry carries a stop; there is no naked-market
-path.
+Watch it land: the order appears in TWS/Gateway and on the **Trades** /
+**Portfolio** pages; the **Audit** page shows `CYCLE_SUMMARY`, `RISK_DECISION`,
+and `ORDER_SUBMITTED` events, streamed live over the WebSocket. Every entry
+carries a stop; there is no naked-market path. It reads only **approved**
+strategies and **promoted** skills, never candidates.
 
-### 7. The kill switch and manual flatten
+### 8. The kill switch and manual flatten
 
 - Click **ENGAGE KILL SWITCH** at any time: new order submission halts
   immediately (the orchestrator and the risk gate both honor the sentinel file).
@@ -125,16 +166,21 @@ path.
   routes a closing order through the risk gate. While the kill switch is on, a
   flatten is vetoed by the gate; release the switch to flatten.
 
-### 8. The self-learning loop (optional, paper only)
+### 9. The self-learning loop (optional, paper only)
 
-Set `LEARNING_CADENCE=daily` (or `after_trades`) in `.env` to let the loop
-reflect on closed paper trades, run controlled experiments on an unburned
-holdout tranche, and either auto-promote a low-blast-radius analysis skill or
-**enqueue** a signal-shaping skill for human approval. It never places or
-modifies an order, it is paused while the kill switch is on, and its LLM steps
-are bounded by `LEARNING_TOKEN_BUDGET` / `LEARNING_COST_BUDGET_USD`. The UI tabs
-**Skill Registry**, **Learning History**, **Why Promoted**, and **Holdout
-Budget** make all of it auditable.
+Set `LEARNING_CADENCE=daily` (or `after_trades`) in `.env` and the orchestrator
+schedules the loop on its own low-cost cadence, **outside** the trading cycle. It
+reflects on closed paper trades, runs controlled experiments on an unburned
+holdout tranche, and either auto-promotes a low-blast-radius analysis skill or
+**enqueues** a signal-shaping skill for human approval. It never places or
+modifies an order, it is paused entirely while the kill switch is on, and its LLM
+steps are bounded by `LEARNING_TOKEN_BUDGET` / `LEARNING_COST_BUDGET_USD` (the
+deterministic backtests cost no credits; if the budget is exhausted the LLM steps
+are skipped and logged). The loop consumes a closed-trade trace: this harness
+never fabricates trade data to feed itself, so until a trade-trace source is
+wired the scheduled tick logs `LEARNING_SKIPPED` and does nothing. The console's
+**Learning** page (skill registry, experiments, holdout budget) makes all of it
+auditable.
 
 ---
 

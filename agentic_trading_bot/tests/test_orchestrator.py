@@ -35,7 +35,7 @@ from discovery.approval_queue import ApprovalQueue
 from learning.holdout_budget import HoldoutBudget
 from learning.registry import SkillRegistry
 from learning.trial_ledger import TrialLedger
-from main import Orchestrator
+from main import Orchestrator, _add_jobs, _learning_tick
 from models.regime_detector import RegimeDetector
 from risk.guardrails import RiskGate
 from testsupport.fakes import FakeIB
@@ -210,6 +210,45 @@ def test_learning_checkpoint_auto_promotes_analysis_and_research_applies_it(tmp_
     assert ib.placed == []
     assert _events(audit, "ORDER_SUBMITTED") == []
     assert _events(audit, "FLATTEN") == []
+
+
+# --------------------------------------------------------- combined entry wiring
+
+
+def test_add_jobs_registers_trading_discovery_and_learning(tmp_path):
+    from apscheduler.schedulers.background import BackgroundScheduler
+
+    from utils.logging import get_logger
+
+    settings = _settings(tmp_path)
+    settings.discovery_enabled = True
+    settings.learning_cadence = "daily"
+    audit = AuditTrail(tmp_path / "audit.db")
+    orch, _ = _orchestrator(tmp_path, settings, audit, FakeIB())
+
+    scheduler = BackgroundScheduler(timezone="UTC")  # not started
+    _add_jobs(scheduler, orch, settings, get_logger("test"))
+    job_ids = {j.id for j in scheduler.get_jobs()}
+
+    assert {"trading", "discovery", "learning"} <= job_ids
+
+
+def test_learning_tick_skips_honestly_without_a_trace_source(tmp_path):
+    from utils.logging import get_logger
+
+    settings = _settings(tmp_path)
+    audit = AuditTrail(tmp_path / "audit.db")
+    ib = FakeIB()
+    orch, _ = _orchestrator(tmp_path, settings, audit, ib)
+
+    # No trace_builder attached: the cadence fires but the loop must not run, must
+    # not execute anything, and must say so in the audit trail.
+    _learning_tick(orch, settings, get_logger("test"))
+
+    assert _events(audit, "LEARNING_SKIPPED")
+    assert _events(audit, "LEARNING_RUN") == []
+    assert ib.placed == []
+    assert _events(audit, "ORDER_SUBMITTED") == []
 
 
 def test_learning_loop_is_paused_when_kill_switch_on(tmp_path):

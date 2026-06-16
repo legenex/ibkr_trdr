@@ -286,12 +286,20 @@ class Orchestrator:
 
 
 # ---------------------------------------------------------------------------
-# Wiring and scheduler (run with: python -m main)
+# Wiring and the combined entry (orchestrator + API in one process)
 # ---------------------------------------------------------------------------
 
 
-def build_orchestrator(settings: Settings = default_settings) -> Orchestrator:
-    """Build a fully-wired orchestrator with real collaborators (paper default)."""
+def build_orchestrator(settings: Settings = default_settings, *, connect: bool = True) -> Orchestrator:
+    """Build a fully-wired orchestrator with real collaborators (paper default).
+
+    The broker connects to the PAPER port by default: no runtime confirmation is
+    passed, so invariant 1 routes it to paper regardless of the LIVE flag.
+
+    Set ``connect=False`` to construct without connecting; ib_async's synchronous
+    connect must run on a thread with no running asyncio event loop, so the
+    combined entry connects later from its scheduler worker thread instead.
+    """
     from backtest.validator import ValidationGate
     from broker.ibkr_client import IBKRClient
     from data.yfinance_source import YFinanceDataSource
@@ -307,10 +315,11 @@ def build_orchestrator(settings: Settings = default_settings) -> Orchestrator:
     learning_db = settings.journal_path / "learning.db"
     broker = IBKRClient(settings=settings, audit=audit)
     # Connect to PAPER by default (no confirmation -> paper port, see invariant 1).
-    try:
-        broker.connect(confirmation=None)
-    except Exception as exc:  # noqa: BLE001
-        get_logger(__name__).error("broker_connect_failed", error=str(exc))
+    if connect:
+        try:
+            broker.connect(confirmation=None)
+        except Exception as exc:  # noqa: BLE001
+            get_logger(__name__).error("broker_connect_failed", error=str(exc))
 
     detector = RegimeDetector(n_iter=30, window=20, random_seed=settings.random_seed)
     return Orchestrator(
@@ -323,32 +332,209 @@ def build_orchestrator(settings: Settings = default_settings) -> Orchestrator:
     )
 
 
-def main() -> None:
-    """Wire the orchestrator and start the APScheduler loop (paper by default)."""
-    from apscheduler.schedulers.blocking import BlockingScheduler
+def _console_broker_factory(settings: Settings, audit: Any) -> Any:
+    """A broker_factory for the API that uses a DISTINCT client id.
 
-    settings = default_settings
-    settings.ensure_dirs()
-    log = get_logger(__name__)
-    orchestrator = build_orchestrator(settings)
+    The API connects its own read-side session to the same paper account so the
+    console shows live positions, account values, and net liquidation without
+    sharing the orchestrator's broker handle across threads. IBKR fans account
+    and position updates out to every connected client id, so both see the same
+    book. Returns None (a flat book in the UI) if the broker is unreachable.
+    """
+    console_settings = settings.model_copy(update={"ibkr_client_id": settings.ibkr_client_id + 1})
 
-    scheduler = BlockingScheduler(timezone="UTC")
-    scheduler.add_job(orchestrator.run_trading_cycle, "interval",
-                      seconds=settings.trading_interval_seconds, id="trading")
+    def factory() -> Optional[Any]:
+        try:
+            from broker.ibkr_client import IBKRClient
+
+            client = IBKRClient(settings=console_settings, audit=audit, auto_reconnect=False)
+            client.connect(confirmation=None, max_retries=1, base_backoff=0.0, timeout=2.0)
+            return client if client.is_connected() else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    return factory
+
+
+def _add_jobs(scheduler: Any, orchestrator: Orchestrator, settings: Settings, log: Any) -> None:
+    """Register the trading, discovery, and learning jobs on a scheduler.
+
+    The trading cycle runs every `trading_interval_seconds`. Discovery (proposes
+    only, never auto-approves) and the self-learning loop (proposes only, paused
+    under the kill switch, budget-bounded) run on their own slower cadences and
+    OUTSIDE the trading cycle. `max_instances=1` + `coalesce` keep a slow cycle
+    from stacking on itself.
+    """
+    scheduler.add_job(
+        orchestrator.run_trading_cycle, "interval",
+        seconds=settings.trading_interval_seconds, id="trading",
+        max_instances=1, coalesce=True,
+    )
     if settings.discovery_enabled:
-        scheduler.add_job(orchestrator.run_discovery_cycle, "interval",
-                          minutes=settings.discovery_interval_minutes, id="discovery")
-    if settings.learning_cadence == "daily":
-        # The learning loop needs a closed-trade trace and a served tranche; the
-        # daily job is a placeholder hook the operator wires to real trade traces.
-        log.info("learning_scheduled_daily", minutes=settings.learning_interval_minutes)
+        scheduler.add_job(
+            orchestrator.run_discovery_cycle, "interval",
+            minutes=settings.discovery_interval_minutes, id="discovery",
+            max_instances=1, coalesce=True,
+        )
+        log.info("discovery_scheduled", minutes=settings.discovery_interval_minutes)
+    if settings.learning_cadence != "off":
+        # The learning loop is OUTSIDE the trading cycle and only ever proposes.
+        # It needs a closed-trade TradeTrace and a served holdout tranche, which
+        # the operator wires from their own trade-trace source (see the runbook).
+        # We schedule the cadence here; run_learning_cycle enforces the kill
+        # switch pause, the per-run budget, and the propose-only contract.
+        minutes = settings.learning_interval_minutes
+        scheduler.add_job(
+            lambda: _learning_tick(orchestrator, settings, log), "interval",
+            minutes=minutes, id="learning", max_instances=1, coalesce=True,
+        )
+        log.info("learning_scheduled", cadence=settings.learning_cadence, interval_minutes=minutes)
 
-    log.warning("orchestrator_starting", mode="PAPER" if not settings.live_trading else "LIVE_FLAG_SET",
-                trading_interval_s=settings.trading_interval_seconds)
+
+def _learning_tick(orchestrator: Orchestrator, settings: Settings, log: Any) -> None:
+    """Scheduled learning hook. Honest about needing a wired trade-trace source.
+
+    A learning cycle requires a real closed-trade trace; this harness never
+    fabricates trade data to feed its own loop. If the operator has attached a
+    `trace_builder` to the orchestrator (returning a (TradeTrace, tranche_id) or
+    None), we run one disciplined cycle; otherwise we log a clear skip. Either
+    way nothing is executed and the risk gate is never touched.
+    """
+    builder = getattr(orchestrator, "trace_builder", None)
+    if builder is None:
+        orchestrator.audit.record(
+            "LEARNING_SKIPPED",
+            {"reason": "no closed-trade trace source wired"},
+            "Learning cadence fired but no trade-trace source is wired; skipped (propose-only, "
+            "nothing executed). See the runbook to attach one.",
+        )
+        return
     try:
-        scheduler.start()
-    except (KeyboardInterrupt, SystemExit):
+        built = builder()
+    except Exception as exc:  # noqa: BLE001
+        log.warning("learning_trace_build_failed", error=str(exc))
+        return
+    if not built:
+        return
+    trace, tranche_id = built
+    orchestrator.run_learning_cycle(trace, tranche_id)
+
+
+def run_scheduler(
+    settings: Settings = default_settings, *, block: bool = True
+) -> tuple[Any, Orchestrator]:
+    """Build the orchestrator and start its APScheduler loop (paper by default).
+
+    All broker work is pinned to a SINGLE scheduler worker thread (an executor of
+    one). ib_async's synchronous API needs a thread with no running asyncio loop,
+    so the broker is also connected on that worker thread, via an immediate
+    one-shot job, before the first trading cycle. Returns (scheduler, orchestrator)
+    so the combined entry can run the API on the main thread; with ``block=True``
+    it starts a BlockingScheduler and does not return until interrupted.
+    """
+    from apscheduler.executors.pool import ThreadPoolExecutor
+
+    log = get_logger(__name__)
+    settings.ensure_dirs()
+    # Construct without connecting; the connect runs on the worker thread below.
+    orchestrator = build_orchestrator(settings, connect=False)
+
+    # One worker thread for every job, so the broker is only ever touched from a
+    # single, loop-free thread (ib_async is not safe across threads or under a
+    # running asyncio loop).
+    executors = {"default": ThreadPoolExecutor(max_workers=1)}
+
+    def connect_broker() -> None:
+        try:
+            orchestrator.broker.connect(confirmation=None)
+        except Exception as exc:  # noqa: BLE001
+            log.error("broker_connect_failed", error=str(exc))
+
+    if block:
+        from apscheduler.schedulers.blocking import BlockingScheduler
+
+        scheduler: Any = BlockingScheduler(timezone="UTC", executors=executors)
+    else:
+        from apscheduler.schedulers.background import BackgroundScheduler
+
+        scheduler = BackgroundScheduler(timezone="UTC", executors=executors)
+
+    scheduler.add_job(connect_broker, "date", id="connect")  # runs once, immediately, on the worker
+    _add_jobs(scheduler, orchestrator, settings, log)
+    log.warning(
+        "orchestrator_starting",
+        mode="PAPER" if not settings.live_trading else "LIVE_FLAG_SET",
+        trading_interval_s=settings.trading_interval_seconds,
+    )
+    scheduler.start()  # BackgroundScheduler returns immediately; BlockingScheduler blocks.
+    return scheduler, orchestrator
+
+
+def serve(settings: Settings = default_settings, *, with_api: bool = True) -> None:
+    """Single entry: bring up the orchestrator scheduler AND the API together.
+
+    The orchestrator's cycles run on a background scheduler worker thread; the
+    FastAPI service runs on the main thread via uvicorn. They share the journal
+    and learning databases and the kill-switch sentinel file, so the console
+    reflects live state and the kill switch written from the UI is the same file
+    the loop checks first every cycle. The API only reads and forwards; it never
+    drives the trading cycle, and it uses its own broker session (a distinct
+    client id) so the two never share an ib_async handle.
+    """
+    log = get_logger(__name__)
+    if not with_api:
+        # Scheduler-only: a BlockingScheduler owns the main thread until interrupt.
+        run_scheduler(settings, block=True)
+        return
+
+    scheduler, orchestrator = run_scheduler(settings, block=False)
+    try:
+        import uvicorn
+
+        from api.server import create_app
+
+        token = settings.api_token.get_secret_value() if settings.api_token is not None else None
+        app = create_app(
+            settings=settings,
+            api_token=token,
+            broker_factory=_console_broker_factory(settings, orchestrator.audit),
+        )
+        log.warning("api_starting", host=settings.api_host, port=settings.api_port)
+        uvicorn.run(app, host=settings.api_host, port=settings.api_port,
+                    log_level=settings.log_level.lower())
+    finally:
+        scheduler.shutdown(wait=False)
+        try:
+            orchestrator.broker.disconnect()
+        except Exception:  # noqa: BLE001
+            pass
         log.warning("orchestrator_stopped")
+
+
+def main(argv: Optional[list[str]] = None) -> None:
+    """Console entry. Default brings up the orchestrator AND the API together.
+
+    Flags:
+      --no-api    run the orchestrator scheduler only (no FastAPI service)
+      --api-only  run only the FastAPI service (no trading scheduler), for when
+                  the orchestrator runs as a separate sibling process
+    """
+    import sys
+
+    args = argv if argv is not None else sys.argv[1:]
+    settings = default_settings
+
+    if "--api-only" in args:
+        from api.server import run as run_api
+
+        get_logger(__name__).warning("api_only_mode")
+        run_api()
+        return
+
+    try:
+        serve(settings, with_api="--no-api" not in args)
+    except (KeyboardInterrupt, SystemExit):
+        get_logger(__name__).warning("orchestrator_stopped")
 
 
 if __name__ == "__main__":
