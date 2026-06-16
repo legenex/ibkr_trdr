@@ -84,6 +84,10 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO")
     # Central seed for any randomness (model fitting, sampling) so runs reproduce.
     random_seed: int = Field(default=42, ge=0)
+    # Per-run LLM budget for the learning loop. When exhausted, LLM steps are
+    # skipped and logged (Agent SDK usage draws from a separate monthly credit).
+    learning_token_budget: int = Field(default=200_000, ge=0)
+    learning_cost_budget_usd: float = Field(default=5.0, ge=0)
 
     @field_validator("log_level")
     @classmethod

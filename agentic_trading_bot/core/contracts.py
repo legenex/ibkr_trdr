@@ -440,11 +440,12 @@ class SkillType(str, Enum):
 
 
 class SkillStatus(str, Enum):
-    """Lifecycle of a skill."""
+    """Lifecycle of a skill: candidate -> shadow -> promoted, or demoted."""
 
+    CANDIDATE = "candidate"  # newly proposed, not yet earned anything
+    SHADOW = "shadow"  # running in shadow A/B (analysis-only) before promotion
     PROMOTED = "promoted"
     DEMOTED = "demoted"
-    SHADOW = "shadow"
 
 
 class AppliedSkill(BaseModel):
@@ -475,12 +476,22 @@ class Skill(BaseModel):
     theme_tags: list[str] = Field(default_factory=list)  # empty = applies to all themes
     prompt_addendum: str = ""  # analysis skills only
     template: Optional[str] = None  # signal-shaping skills only
+    # Canonical content: the prompt content (analysis) or the template name
+    # (signal-shaping). Kept alongside prompt_addendum/template for the agents.
+    content_or_template: Optional[str] = None
     params: dict[str, Any] = Field(default_factory=dict)
     live_performance: float = 0.0
     trials: int = 0
     provenance: str = ""
+    provenance_reflection_id: Optional[str] = None
+    performance_metrics: dict[str, float] = Field(default_factory=dict)
     created_ts: str = Field(default_factory=_utc_now_iso)
     updated_ts: str = Field(default_factory=_utc_now_iso)
+
+    @property
+    def created_at(self) -> str:
+        """Alias for created_ts (Stage 7.5 naming)."""
+        return self.created_ts
 
     def as_applied(self) -> AppliedSkill:
         """Return the compact provenance record for this skill."""
@@ -583,3 +594,117 @@ class ExperimentResult(BaseModel):
     def promotable(self) -> bool:
         """A FAIL is never promotable downstream; mirrors `passed`."""
         return self.passed
+
+
+# ---------------------------------------------------------------------------
+# Self-learning loop contracts (Stage 7.5: reflect -> hypothesize -> experiment)
+# ---------------------------------------------------------------------------
+
+
+class ForwardResult(BaseModel):
+    """Paper-forward confirmation: did a skill beat its baseline on NEW paper data.
+
+    Signal-shaping skills cannot be promoted on backtest evidence alone; they need
+    a passing forward result on genuinely new incoming paper data first.
+    """
+
+    passed: bool
+    period_days: int = 0
+    n_trades: int = 0
+    sharpe: float = 0.0
+    baseline_sharpe: float = 0.0
+    notes: str = ""
+
+
+class HypothesisStatus(str, Enum):
+    """Lifecycle of a hypothesis."""
+
+    PROPOSED = "proposed"
+    REGISTERED = "registered"
+    TESTED = "tested"
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"
+
+
+class Hypothesis(BaseModel):
+    """A single-variable, pre-registered hypothesis versus a frozen baseline."""
+
+    hypothesis_id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    statement: str
+    single_variable: str
+    baseline_ref: str = ""
+    pre_registered_criteria: PreRegisteredCriteria = Field(default_factory=PreRegisteredCriteria)
+    status: HypothesisStatus = HypothesisStatus.PROPOSED
+    created_at: str = Field(default_factory=_utc_now_iso)
+
+
+class Reflection(BaseModel):
+    """The learning agent's analysis-only reflection on a closed trade or batch.
+
+    Produced by a cheap LLM step. It explains what happened, whether the thesis
+    was correct, the lessons, and one to three single-variable hypotheses with
+    pre-registered success criteria. It never proposes executable code.
+    """
+
+    reflection_id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    trace_ref: str
+    what_happened: str
+    thesis_correctness: str = ""
+    lessons: list[str] = Field(default_factory=list)
+    hypotheses: list[Hypothesis] = Field(default_factory=list)
+    created_at: str = Field(default_factory=_utc_now_iso)
+
+
+class ExperimentVerdict(str, Enum):
+    """Verdict of a learning experiment."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    PENDING = "pending"
+
+
+class Experiment(BaseModel):
+    """The record of one candidate-versus-baseline experiment for a hypothesis."""
+
+    experiment_id: str = Field(default_factory=lambda: uuid4().hex[:12])
+    hypothesis_id: str = ""
+    baseline_snapshot: dict[str, Any] = Field(default_factory=dict)
+    candidate_skill_id: str = ""
+    baseline_result: Optional[ValidationResult] = None
+    candidate_result: Optional[ValidationResult] = None
+    forward_result: Optional[ForwardResult] = None
+    trials_charged: int = 0
+    holdout_tranche_id: str = ""
+    verdict: ExperimentVerdict = ExperimentVerdict.PENDING
+    reasons: list[str] = Field(default_factory=list)
+    created_at: str = Field(default_factory=_utc_now_iso)
+
+
+class TradeTrace(BaseModel):
+    """The full trace of a closed trade fed to the reflection step (read-only)."""
+
+    trace_ref: str
+    theme: str = ""
+    brief_summary: str = ""
+    spec_summary: str = ""
+    validation_summary: str = ""
+    regime: str = ""
+    pnl: float = 0.0
+    costs: float = 0.0
+    outcome: str = ""
+    family: str = ""
+    extra: dict[str, Any] = Field(default_factory=dict)
+
+
+class LearningResult(BaseModel):
+    """Summary of one learning loop run, for the dashboard and audit."""
+
+    period: str
+    reflections_count: int = 0
+    experiments_run: int = 0
+    skills_promoted: int = 0
+    skills_demoted: int = 0
+    skills_queued_for_approval: int = 0
+    suggestions_logged: int = 0
+    holdout_budget_consumed: int = 0
+    created_at: str = Field(default_factory=_utc_now_iso)
