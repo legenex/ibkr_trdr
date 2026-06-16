@@ -41,6 +41,10 @@ APScheduler==3.11.2
 streamlit==1.58.0
 plotly==6.8.0
 
+# Web API for the React flight-deck frontend (web/).
+fastapi==0.137.1
+uvicorn==0.49.0
+
 # Tests.
 pytest==9.1.0
 pytest-asyncio==1.4.0

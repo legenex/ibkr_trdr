@@ -1,0 +1,33 @@
+/* Design tokens. Semantic colors (long/short/caution) carry meaning and appear
+   nowhere decoratively. Gold is identity, not data. */
+:root {
+  --ink-900: #0a0e14;
+  --ink-800: #11161f;
+  --ink-700: #161d29;
+  --ink-600: #1e2735;
+  --hairline: rgba(150, 170, 200, 0.12);
+
+  --text-hi: #e6edf3;
+  --text-mid: #9fb0c3;
+  --text-dim: #5c6b7e;
+
+  --gold: #e8b341;
+  --gold-soft: rgba(232, 179, 65, 0.14);
+
+  --long: #3fb68b;
+  --short: #e5484d;
+  --caution: #e8a23d;
+
+  /* type */
+  --font-display: "Space Grotesk", system-ui, sans-serif;
+  --font-body: "Geist Sans", system-ui, sans-serif;
+  --font-mono: "Geist Mono", "JetBrains Mono", ui-monospace, monospace;
+
+  /* surface */
+  --radius: 14px;
+  --radius-sm: 9px;
+  --shadow-ambient: 0 1px 2px rgba(0, 0, 0, 0.4), 0 8px 24px rgba(0, 0, 0, 0.28);
+  --top-highlight: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+
+  --gutter: 22px;
+}

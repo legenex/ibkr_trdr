@@ -275,3 +275,46 @@ def test_reconcile_in_sync_when_matching(make_client):
     assert report.in_sync is True
     assert report.position_drift == []
     assert report.order_drift == []
+
+
+# --------------------------------------------------------------- flatten
+
+
+def _long_position(symbol="AAPL", qty=100):
+    return SimpleNamespace(account="DU1", contract=SimpleNamespace(symbol=symbol), position=qty, avgCost=100.0)
+
+
+def test_flatten_submits_closing_market_order_and_audits(make_client):
+    client, ib, audit = make_client()
+    ib._positions = [_long_position()]
+    # A resting bracket order for the symbol that should be cancelled first.
+    ib._open_trades = [SimpleNamespace(order=SimpleNamespace(orderId=7, action="SELL"),
+                                       contract=SimpleNamespace(symbol="AAPL"),
+                                       orderStatus=SimpleNamespace(status="Submitted"))]
+    client.connect(base_backoff=0)
+    result = client.flatten_position("AAPL")
+    assert result.accepted is True
+    assert result.kind.value == "flatten"
+    assert len(ib.placed) == 1  # a single closing market order
+    assert ib.cancelled  # resting order cancelled
+    assert _events(audit, "FLATTEN")
+
+
+def test_flatten_no_position_is_not_accepted(make_client):
+    client, ib, _ = make_client()
+    client.connect(base_backoff=0)
+    result = client.flatten_position("AAPL")
+    assert result.accepted is False
+    assert ib.placed == []
+
+
+def test_flatten_blocked_when_risk_gate_vetoes(make_client):
+    client, ib, audit = make_client()
+    ib._positions = [_long_position()]
+    client.connect(base_backoff=0)
+    # Simulate the kill switch / a veto from the gate: nothing is submitted.
+    client._risk_evaluate = lambda order, ctx=None: RiskDecision.veto("kill switch engaged")
+    result = client.flatten_position("AAPL")
+    assert result.accepted is False
+    assert ib.placed == []
+    assert _events(audit, "RISK_VETO")

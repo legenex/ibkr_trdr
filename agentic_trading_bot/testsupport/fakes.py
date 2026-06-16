@@ -77,6 +77,7 @@ class FakeIB:
         self._next_id = 1000
         self.connect_calls: list[dict[str, Any]] = []
         self.placed: list[tuple[Any, Any]] = []
+        self.cancelled: list[Any] = []
 
         # Canned read data, settable by tests. Defaults make a connected broker
         # look funded and liquid so the real risk gate has equity and history to
@@ -172,6 +173,9 @@ class FakeIB:
 
     def cancelMktData(self, contract: Any) -> None:
         pass
+
+    def cancelOrder(self, order: Any) -> None:
+        self.cancelled.append(order)
 
     def sleep(self, seconds: float) -> None:
         pass

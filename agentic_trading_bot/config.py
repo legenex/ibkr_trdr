@@ -58,6 +58,14 @@ class Settings(BaseSettings):
     # --- Secrets (optional until later build stages) ---
     anthropic_api_key: Optional[SecretStr] = Field(default=None)
     polygon_api_key: Optional[SecretStr] = Field(default=None)
+    # Shared secret the local API requires on every request (header or query).
+    # Optional in config: when unset the API generates an ephemeral token at
+    # startup and logs it, so a random local process still cannot drive it.
+    api_token: Optional[SecretStr] = Field(default=None)
+
+    # --- Local API service ---
+    api_host: str = Field(default="127.0.0.1")
+    api_port: int = Field(default=8000, ge=1, le=65535)
 
     # --- Risk parameters (hard limits; ranges enforced) ---
     max_daily_drawdown_pct: float = Field(default=3.0, gt=0, le=100)
@@ -88,6 +96,35 @@ class Settings(BaseSettings):
     # skipped and logged (Agent SDK usage draws from a separate monthly credit).
     learning_token_budget: int = Field(default=200_000, ge=0)
     learning_cost_budget_usd: float = Field(default=5.0, ge=0)
+
+    # --- Orchestrator / scheduler cadences ---
+    # Comma-separated watchlist; parsed by watchlist_symbols.
+    watchlist: str = Field(default="SPY,AAPL,MSFT")
+    regime_proxy_symbol: str = Field(default="SPY")
+    trading_interval_seconds: int = Field(default=60, ge=5)
+    discovery_enabled: bool = Field(default=False)
+    discovery_interval_minutes: int = Field(default=1440, ge=1)
+    discovery_theme: str = Field(default="scheduled watchlist scan")
+    # Learning loop cadence: off | daily | after_trades.
+    learning_cadence: str = Field(default="off")
+    learning_after_n_trades: int = Field(default=5, ge=1)
+    learning_interval_minutes: int = Field(default=1440, ge=1)
+    # Reward-to-risk multiple for orchestrator-built bracket targets.
+    bracket_reward_risk: float = Field(default=2.0, gt=0)
+
+    @property
+    def watchlist_symbols(self) -> list[str]:
+        """The watchlist as a list of upper-case symbols."""
+        return [s.strip().upper() for s in self.watchlist.split(",") if s.strip()]
+
+    @field_validator("learning_cadence")
+    @classmethod
+    def _validate_cadence(cls, value: str) -> str:
+        allowed = {"off", "daily", "after_trades"}
+        low = value.lower()
+        if low not in allowed:
+            raise ValueError(f"learning_cadence must be one of {sorted(allowed)}, got {value!r}")
+        return low
 
     @field_validator("log_level")
     @classmethod

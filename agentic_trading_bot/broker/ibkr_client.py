@@ -714,6 +714,74 @@ class IBKRClient:
             symbol=order.symbol,
         )
 
+    def flatten_position(self, symbol: str) -> OrderPlacementResult:
+        """Flatten an open position with a closing market order (manual exit).
+
+        This is the explicit, human flatten action (invariant 7). It is a
+        risk-REDUCING exit, so it still routes through the risk gate (which
+        permits exits but is halted by the kill switch) and it cancels the
+        position's resting bracket orders before submitting the close. It is the
+        one sanctioned market-exit path; entries still require a stop.
+        """
+        self._require_connected()
+        position = next(
+            (p for p in self.positions() if p.symbol == symbol and p.quantity != 0), None
+        )
+        if position is None:
+            reason = f"no open position in {symbol} to flatten"
+            return OrderPlacementResult(
+                accepted=False,
+                reason=reason,
+                kind=OrderKind.FLATTEN,
+                risk_decision=RiskDecision(approved=False, reason=reason),
+                ib_order_ids=[],
+                symbol=symbol,
+            )
+
+        quantity = abs(position.quantity)
+        side = OrderSide.SELL if position.quantity > 0 else OrderSide.BUY
+        closing = Order(symbol=symbol, side=side, quantity=quantity, order_type=OrderType.MKT)
+
+        decision = self._evaluate_risk(closing)
+        if not decision.approved:
+            # The risk gate (for example the kill switch) blocked the flatten.
+            return self._vetoed_result(closing, decision, OrderKind.FLATTEN)
+
+        self._cancel_symbol_orders(symbol)
+        contract = self._stock(closing)
+        from ib_async import MarketOrder
+
+        market = MarketOrder(side.value, quantity)
+        trade = self.ib.placeOrder(contract, market)
+        order_id = trade.order.orderId
+
+        self._intended_positions[symbol] = 0.0
+        self.log.info("position_flattened", symbol=symbol, side=side.value, quantity=quantity)
+        self.audit.record(
+            "FLATTEN",
+            {"symbol": symbol, "side": side.value, "quantity": quantity, "ib_order_id": order_id},
+            f"Manual flatten of {symbol}: closing {quantity} via market order",
+        )
+        return OrderPlacementResult(
+            accepted=True,
+            reason="submitted closing market order (flatten)",
+            kind=OrderKind.FLATTEN,
+            risk_decision=decision,
+            ib_order_ids=[order_id],
+            symbol=symbol,
+        )
+
+    def _cancel_symbol_orders(self, symbol: str) -> None:
+        """Cancel any resting orders (the brackets) for a symbol before flattening."""
+        for trade in self.ib.openTrades():
+            contract = getattr(trade, "contract", None)
+            order = getattr(trade, "order", None)
+            if getattr(contract, "symbol", None) == symbol and order is not None:
+                try:
+                    self.ib.cancelOrder(order)
+                except Exception as exc:  # noqa: BLE001
+                    self.log.warning("cancel_order_failed", symbol=symbol, error=str(exc))
+
     def _vetoed_result(
         self, order: Order, decision: RiskDecision, kind: OrderKind
     ) -> OrderPlacementResult:

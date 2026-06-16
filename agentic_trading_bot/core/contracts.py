@@ -222,6 +222,7 @@ class OrderKind(str, Enum):
 
     SINGLE_WITH_STOP = "single_with_stop"
     BRACKET = "bracket"
+    FLATTEN = "flatten"  # explicit human exit: a risk-reducing closing order
 
 
 class OrderPlacementResult(BaseModel):

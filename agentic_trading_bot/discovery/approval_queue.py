@@ -69,6 +69,21 @@ class ApprovalQueue:
         self._conn.row_factory = sqlite3.Row
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """Additive, idempotent migrations for older databases.
+
+        Adds the `enabled` flag to the approved-strategies store. SQLite has no
+        ADD COLUMN IF NOT EXISTS, so a duplicate-column error is treated as a
+        no-op. Approved strategies default to enabled.
+        """
+        try:
+            self._conn.execute(
+                "ALTER TABLE approved_strategies ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"
+            )
+        except sqlite3.OperationalError:
+            pass  # column already present
 
     # ------------------------------------------------------------- enqueue
 
@@ -114,18 +129,44 @@ class ApprovalQueue:
         return self._list("", ())
 
     def list_approved_strategies(self) -> list[dict[str, Any]]:
-        """Return the approved-strategies store rows."""
+        """Return the approved-strategies store rows (newest enable flag included)."""
         with self._lock:
             rows = self._conn.execute(
-                "SELECT proposal_id, name, template, approved_by, approved_ts, mode, spec_json "
-                "FROM approved_strategies ORDER BY approved_ts ASC"
+                "SELECT proposal_id, name, template, approved_by, approved_ts, mode, "
+                "enabled, spec_json FROM approved_strategies ORDER BY approved_ts ASC"
             ).fetchall()
         out = []
         for row in rows:
             record = dict(row)
+            record["enabled"] = bool(record.get("enabled", 1))
             record["spec"] = json.loads(record.pop("spec_json"))
             out.append(record)
         return out
+
+    def set_strategy_enabled(
+        self, proposal_id: str, enabled: bool, audit: Any, who: str = "ui"
+    ) -> dict[str, Any]:
+        """Enable or disable an already-approved strategy.
+
+        This toggles whether the orchestrator may act on the approved strategy.
+        It cannot approve, create, or execute anything; disabling only reduces
+        reliance. Raises ApprovalError if the strategy is not in the approved
+        store. The change is audited.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "UPDATE approved_strategies SET enabled = ? WHERE proposal_id = ?",
+                (1 if enabled else 0, proposal_id),
+            )
+            if cur.rowcount == 0:
+                raise ApprovalError(f"unknown approved strategy {proposal_id}")
+        audit.record(
+            "STRATEGY_ENABLED" if enabled else "STRATEGY_DISABLED",
+            {"proposal_id": proposal_id, "by": who, "enabled": enabled},
+            f"{who} {'enabled' if enabled else 'disabled'} approved strategy {proposal_id}",
+        )
+        rows = [r for r in self.list_approved_strategies() if r["proposal_id"] == proposal_id]
+        return rows[0] if rows else {"proposal_id": proposal_id, "enabled": enabled}
 
     def _list(self, where: str, params: tuple) -> list[Proposal]:
         sql = "SELECT proposal_json FROM proposals " + where + " ORDER BY created_ts ASC"

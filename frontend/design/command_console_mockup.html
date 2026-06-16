@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Command Console mockup</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/tabler-icons/3.31.0/tabler-icons.min.css" />
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root{
+  --ink-900:#0A0E14; --ink-800:#11161F; --ink-700:#161D29; --ink-600:#1E2735;
+  --hairline:rgba(150,170,200,.12); --hairline-2:rgba(150,170,200,.20);
+  --text-hi:#E6EDF3; --text-mid:#9FB0C3; --text-dim:#5C6B7E;
+  --gold:#E8B341; --gold-soft:rgba(232,179,65,.14);
+  --long:#3FB68B; --short:#E5484D; --caution:#E8A23D;
+  --display:'Space Grotesk',system-ui,sans-serif;
+  --body:'Geist',system-ui,-apple-system,sans-serif;
+  --mono:'JetBrains Mono',ui-monospace,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%}
+body{
+  background:var(--ink-900); color:var(--text-hi); font-family:var(--body);
+  font-size:14px; line-height:1.5; -webkit-font-smoothing:antialiased;
+}
+.num{font-family:var(--mono); font-variant-numeric:tabular-nums}
+.eyebrow{font-family:var(--display); font-size:11px; letter-spacing:.22em; text-transform:uppercase; color:var(--text-dim)}
+.app{display:grid; grid-template-columns:236px 1fr; min-height:100vh}
+
+/* nav rail */
+.rail{background:var(--ink-800); border-right:1px solid var(--hairline); padding:20px 14px; display:flex; flex-direction:column; gap:4px}
+.brand{display:flex; align-items:center; gap:10px; padding:6px 8px 18px}
+.brand .mark{width:26px; height:26px; border-radius:7px; background:linear-gradient(150deg,var(--gold),#b9852a); display:grid; place-items:center; color:#1a1205; font-weight:700; font-family:var(--display)}
+.brand b{font-family:var(--display); font-weight:600; letter-spacing:.04em; font-size:15px}
+.brand span{display:block; font-size:10px; color:var(--text-dim); letter-spacing:.16em; text-transform:uppercase}
+.nav{display:flex; align-items:center; gap:11px; padding:9px 11px; border-radius:9px; color:var(--text-mid); cursor:pointer; font-size:13.5px; transition:background .15s,color .15s}
+.nav i{font-size:18px; width:18px; text-align:center}
+.nav:hover{background:var(--ink-700); color:var(--text-hi)}
+.nav.active{background:var(--gold-soft); color:var(--gold)}
+.nav.active::before{content:''; position:absolute; left:0; width:3px; height:20px; background:var(--gold); border-radius:0 3px 3px 0; margin-left:-14px}
+.nav.active{position:relative}
+.rail .spacer{flex:1}
+.rail-foot{font-size:11px; color:var(--text-dim); padding:8px 11px; border-top:1px solid var(--hairline)}
+
+/* main */
+.main{padding:0 28px 40px; max-width:1180px}
+.status{display:flex; align-items:center; gap:18px; height:58px; border-bottom:1px solid var(--hairline); position:sticky; top:0; background:var(--ink-900); z-index:5}
+.pill{display:inline-flex; align-items:center; gap:7px; font-size:12px; padding:5px 11px; border-radius:999px; border:1px solid var(--hairline-2)}
+.pill.paper{color:var(--long); border-color:rgba(63,182,139,.35); background:rgba(63,182,139,.08)}
+.dot{width:7px; height:7px; border-radius:50%; background:var(--long); box-shadow:0 0 0 0 rgba(63,182,139,.5); animation:pulse 2.4s infinite}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(63,182,139,.45)}70%{box-shadow:0 0 0 6px rgba(63,182,139,0)}100%{box-shadow:0 0 0 0 rgba(63,182,139,0)}}
+.status .right{margin-left:auto; display:flex; align-items:center; gap:16px; color:var(--text-mid); font-size:12.5px}
+.ks{display:inline-flex; align-items:center; gap:8px; font-size:12px; color:var(--text-mid)}
+.ks .track{width:38px; height:20px; border-radius:999px; background:var(--ink-600); border:1px solid var(--hairline-2); position:relative}
+.ks .knob{position:absolute; top:2px; left:2px; width:14px; height:14px; border-radius:50%; background:var(--long)}
+
+.head{display:flex; align-items:flex-end; justify-content:space-between; padding:24px 0 18px}
+.head h1{font-family:var(--display); font-weight:600; font-size:26px; margin:6px 0 0; letter-spacing:.01em}
+.head .sub{color:var(--text-mid); font-size:13px}
+.btn{font-family:var(--body); font-size:12.5px; color:var(--text-mid); background:var(--ink-700); border:1px solid var(--hairline-2); padding:8px 13px; border-radius:9px; cursor:pointer; display:inline-flex; gap:7px; align-items:center}
+.btn:hover{color:var(--text-hi); border-color:var(--hairline-2)}
+
+/* instrument cluster: the signature */
+.cluster{display:grid; grid-template-columns:1.5fr 1fr 1fr 1fr; gap:1px; background:var(--hairline); border:1px solid var(--hairline); border-radius:16px; overflow:hidden; margin-bottom:20px}
+.cell{background:var(--ink-700); padding:18px 18px 20px}
+.cell .lab{font-size:11px; letter-spacing:.16em; text-transform:uppercase; color:var(--text-dim); margin-bottom:14px}
+.ladder{display:flex; gap:6px; margin-bottom:14px}
+.seg{flex:1; height:8px; border-radius:3px; background:var(--ink-600)}
+.seg.on{background:var(--short); box-shadow:0 0 14px rgba(229,72,77,.5)}
+.regime-name{font-family:var(--display); font-size:30px; font-weight:600; color:var(--text-hi); line-height:1}
+.regime-name b{color:var(--short)}
+.conf{display:inline-flex; align-items:center; gap:6px; margin-top:10px; font-size:12px; color:var(--long); background:rgba(63,182,139,.10); padding:3px 9px; border-radius:999px}
+.ladder-labels{display:flex; justify-content:space-between; font-size:10px; color:var(--text-dim); margin-top:8px; letter-spacing:.04em}
+
+.ring-wrap{display:flex; align-items:center; gap:16px}
+.ring{position:relative; width:96px; height:96px; flex:none}
+.ring svg{transform:rotate(-90deg)}
+.ring .mid{position:absolute; inset:0; display:grid; place-items:center; text-align:center}
+.ring .mid .v{font-family:var(--mono); font-variant-numeric:tabular-nums; font-size:20px; color:var(--text-hi)}
+.ring .mid .l{font-size:10px; color:var(--text-dim)}
+.cell .meta{font-size:12px; color:var(--text-mid)}
+.cell .meta .k{color:var(--text-dim)}
+
+/* guarded kill */
+.guard{display:flex; flex-direction:column; gap:12px}
+.kill-btn{display:flex; align-items:center; justify-content:center; gap:9px; height:48px; border-radius:11px; border:1px solid rgba(229,72,77,.4); color:var(--short); background:rgba(229,72,77,.07); font-family:var(--display); font-weight:600; letter-spacing:.04em; font-size:13.5px; cursor:pointer}
+.kill-btn:hover{background:rgba(229,72,77,.14)}
+.guard .note{font-size:11px; color:var(--text-dim); line-height:1.5}
+
+/* tiles */
+.tiles{display:grid; grid-template-columns:repeat(4,1fr); gap:14px; margin-bottom:20px}
+.tile{background:var(--ink-700); border:1px solid var(--hairline); border-radius:13px; padding:15px 16px}
+.tile .t{font-size:11px; letter-spacing:.14em; text-transform:uppercase; color:var(--text-dim)}
+.tile .big{font-family:var(--mono); font-variant-numeric:tabular-nums; font-size:23px; margin-top:9px; color:var(--text-hi)}
+.tile .big.pos{color:var(--long)} .tile .big.neg{color:var(--short)}
+.tile .delta{font-size:12px; margin-top:5px; color:var(--text-mid)}
+.tile .delta.pos{color:var(--long)} .tile .delta.neg{color:var(--short)}
+
+/* lower grid */
+.lower{display:grid; grid-template-columns:1.55fr 1fr; gap:18px}
+.panel{background:var(--ink-700); border:1px solid var(--hairline); border-radius:14px; padding:18px}
+.panel h3{font-family:var(--display); font-weight:600; font-size:14px; margin:0 0 4px; letter-spacing:.02em}
+.panel .ph{display:flex; align-items:center; justify-content:space-between; margin-bottom:14px}
+.panel .ph .eyebrow{margin:0}
+.equity{width:100%; height:150px}
+.eq-foot{display:flex; gap:24px; margin-top:8px; font-size:12px; color:var(--text-mid)}
+.eq-foot b{font-family:var(--mono); font-variant-numeric:tabular-nums; color:var(--text-hi); font-weight:500}
+
+.feed{display:flex; flex-direction:column}
+.ev{display:flex; gap:11px; padding:10px 0; border-bottom:1px solid var(--hairline); font-size:12.5px}
+.ev:last-child{border-bottom:0}
+.ev i{font-size:15px; margin-top:1px}
+.ev .x{flex:1}
+.ev .x .m{color:var(--text-hi)}
+.ev .x .s{color:var(--text-dim); font-size:11px; margin-top:2px}
+.ev .ts{font-family:var(--mono); color:var(--text-dim); font-size:11px}
+.i-long{color:var(--long)} .i-gold{color:var(--gold)} .i-short{color:var(--short)} .i-mid{color:var(--text-mid)}
+
+.learn{display:flex; flex-direction:column; gap:12px}
+.lrow{display:flex; align-items:center; justify-content:space-between; font-size:12.5px; padding:8px 0; border-bottom:1px solid var(--hairline)}
+.lrow:last-child{border-bottom:0}
+.lrow .k{color:var(--text-mid)}
+.lrow .v{font-family:var(--mono); font-variant-numeric:tabular-nums; color:var(--text-hi)}
+.tag{font-size:11px; padding:2px 8px; border-radius:999px}
+.tag.promoted{color:var(--long); background:rgba(63,182,139,.10)}
+.tag.queued{color:var(--gold); background:var(--gold-soft)}
+.tag.rejected{color:var(--text-mid); background:var(--ink-600)}
+.budget{height:7px; border-radius:999px; background:var(--ink-600); overflow:hidden; margin-top:6px}
+.budget i{display:block; height:100%; width:62%; background:var(--gold)}
+
+@media (prefers-reduced-motion: reduce){ .dot{animation:none} }
+</style>
+</head>
+<body>
+<div class="app">
+
+  <aside class="rail">
+    <div class="brand">
+      <div class="mark">A</div>
+      <div><b>HARNESS</b><span>operator console</span></div>
+    </div>
+    <div class="nav active"><i class="ti ti-dashboard"></i> Command</div>
+    <div class="nav"><i class="ti ti-briefcase"></i> Portfolio</div>
+    <div class="nav"><i class="ti ti-arrows-exchange"></i> Trades</div>
+    <div class="nav"><i class="ti ti-flask"></i> Research &amp; approvals</div>
+    <div class="nav"><i class="ti ti-target-arrow"></i> Strategies</div>
+    <div class="nav"><i class="ti ti-brain"></i> Learning</div>
+    <div class="nav"><i class="ti ti-settings"></i> Settings</div>
+    <div class="nav"><i class="ti ti-list-search"></i> Audit</div>
+    <div class="spacer"></div>
+    <div class="rail-foot">Build v2 · paper<br/>regime model loaded</div>
+  </aside>
+
+  <main class="main">
+    <div class="status">
+      <span class="pill paper"><span class="dot"></span> PAPER</span>
+      <span class="ks"><span class="track"><span class="knob"></span></span> Kill switch off</span>
+      <span style="color:var(--text-mid);font-size:12.5px"><i class="ti ti-plug-connected" style="color:var(--long)"></i> IBKR connected</span>
+      <div class="right"><i class="ti ti-clock-hour-4"></i> <span class="num" id="clock">14:32:07</span> ET</div>
+    </div>
+
+    <div class="head">
+      <div>
+        <div class="eyebrow">mission control</div>
+        <h1>Command</h1>
+      </div>
+      <button class="btn"><i class="ti ti-refresh"></i> Live</button>
+    </div>
+
+    <section class="cluster">
+      <div class="cell">
+        <div class="lab">Market regime</div>
+        <div class="ladder">
+          <span class="seg"></span><span class="seg on"></span><span class="seg"></span><span class="seg"></span><span class="seg"></span>
+        </div>
+        <div class="ladder-labels"><span>Crash</span><span>Bear</span><span>Neutral</span><span>Bull</span><span>Euphoria</span></div>
+        <div style="margin-top:16px" class="regime-name"><b>Bear</b></div>
+        <span class="conf"><i class="ti ti-arrow-up" style="font-size:13px"></i> 67% confidence</span>
+      </div>
+
+      <div class="cell">
+        <div class="lab">Daily drawdown</div>
+        <div class="ring-wrap">
+          <div class="ring">
+            <svg width="96" height="96"><circle cx="48" cy="48" r="40" fill="none" stroke="var(--hairline-2)" stroke-width="7"/><circle cx="48" cy="48" r="40" fill="none" stroke="var(--gold)" stroke-width="7" stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="150.7" style="filter:drop-shadow(0 0 6px rgba(232,179,65,.45))"/></svg>
+            <div class="mid"><div class="v">1.2%</div><div class="l">of 3.0%</div></div>
+          </div>
+          <div class="meta"><span class="k">limit</span> 3.0%<br/><span class="k">breaker</span> armed</div>
+        </div>
+      </div>
+
+      <div class="cell">
+        <div class="lab">Gross exposure</div>
+        <div class="ring-wrap">
+          <div class="ring">
+            <svg width="96" height="96"><circle cx="48" cy="48" r="40" fill="none" stroke="var(--hairline-2)" stroke-width="7"/><circle cx="48" cy="48" r="40" fill="none" stroke="var(--long)" stroke-width="7" stroke-linecap="round" stroke-dasharray="251.2" stroke-dashoffset="145.7"/></svg>
+            <div class="mid"><div class="v">42%</div><div class="l">of 100%</div></div>
+          </div>
+          <div class="meta"><span class="k">cap</span> 100%<br/><span class="k">names</span> 4</div>
+        </div>
+      </div>
+
+      <div class="cell">
+        <div class="lab">Halt control</div>
+        <div class="guard">
+          <button class="kill-btn"><i class="ti ti-hand-stop"></i> Engage kill switch</button>
+          <div class="note">Halts new order submission at once. Does not flatten. Flatten is a separate, confirmed action.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="tiles">
+      <div class="tile"><div class="t">Net liquidation</div><div class="big">$248,910</div><div class="delta pos">+$1,240 today</div></div>
+      <div class="tile"><div class="t">Day P&amp;L</div><div class="big pos">+$1,240</div><div class="delta pos">+0.50%</div></div>
+      <div class="tile"><div class="t">Open positions</div><div class="big">4</div><div class="delta">2 long · 2 short</div></div>
+      <div class="tile"><div class="t">Weekly drawdown</div><div class="big">2.4%</div><div class="delta">of 6.0% limit</div></div>
+    </section>
+
+    <section class="lower">
+      <div class="panel">
+        <div class="ph"><div><div class="eyebrow">last 30 sessions</div><h3>Equity curve</h3></div><span class="num" style="color:var(--long);font-size:13px">+4.8%</span></div>
+        <svg class="equity" viewBox="0 0 560 150" preserveAspectRatio="none">
+          <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="rgba(232,179,65,.22)"/><stop offset="1" stop-color="rgba(232,179,65,0)"/></linearGradient></defs>
+          <path d="M0,120 L40,112 L80,118 L120,98 L160,104 L200,84 L240,92 L280,70 L320,78 L360,58 L400,64 L440,46 L480,52 L520,34 L560,40 L560,150 L0,150 Z" fill="url(#g)"/>
+          <path d="M0,120 L40,112 L80,118 L120,98 L160,104 L200,84 L240,92 L280,70 L320,78 L360,58 L400,64 L440,46 L480,52 L520,34 L560,40" fill="none" stroke="var(--gold)" stroke-width="2"/>
+        </svg>
+        <div class="eq-foot"><span>peak <b>$251,400</b></span><span>max dd <b>3.1%</b></span><span>sharpe (net) <b>0.83</b></span></div>
+      </div>
+
+      <div class="panel">
+        <div class="ph"><div><div class="eyebrow">live</div><h3>Activity</h3></div></div>
+        <div class="feed">
+          <div class="ev"><i class="ti ti-circle-check i-long"></i><div class="x"><div class="m">Filled NVDA 50 @ 121.40</div><div class="s">bracket · stop 117.10 · donchian-breakout</div></div><div class="ts">14:31</div></div>
+          <div class="ev"><i class="ti ti-shield-check i-mid"></i><div class="x"><div class="m">Risk gate shrank order 1000 → 100</div><div class="s">risk-per-trade budget</div></div><div class="ts">14:31</div></div>
+          <div class="ev"><i class="ti ti-bulb i-gold"></i><div class="x"><div class="m">Skill promoted: frame-bear-catalysts</div><div class="s">analysis-only · shadow A/B 0.74 vs 0.55</div></div><div class="ts">14:18</div></div>
+          <div class="ev"><i class="ti ti-x i-short"></i><div class="x"><div class="m">Proposal rejected by gate</div><div class="s">deflated sharpe below 0.95 · cumulative N</div></div><div class="ts">14:02</div></div>
+        </div>
+      </div>
+    </section>
+
+    <section class="lower" style="margin-top:18px">
+      <div class="panel">
+        <div class="ph"><div><div class="eyebrow">self-learning loop</div><h3>Learning status</h3></div><span style="font-size:12px;color:var(--text-dim)">last run 14:18</span></div>
+        <div class="learn">
+          <div class="lrow"><span class="k">Experiments this run</span><span class="v">2</span></div>
+          <div class="lrow"><span class="k">Outcome</span><span><span class="tag promoted">1 promoted</span> <span class="tag queued">0 queued</span> <span class="tag rejected">1 rejected</span></span></div>
+          <div class="lrow"><span class="k">Risk suggestions</span><span class="v">1 logged</span></div>
+          <div class="lrow" style="border:0"><span class="k">Holdout budget</span><span class="v">2 of 8 evals left</span></div>
+          <div class="budget"><i></i></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="ph"><div><div class="eyebrow">guardrails</div><h3>Circuit breakers</h3></div></div>
+        <div class="learn">
+          <div class="lrow"><span class="k">Daily drawdown</span><span class="tag promoted">armed · 1.2 / 3.0%</span></div>
+          <div class="lrow"><span class="k">Weekly drawdown</span><span class="tag promoted">armed · 2.4 / 6.0%</span></div>
+          <div class="lrow"><span class="k">Liquidity filter</span><span class="tag promoted">active</span></div>
+          <div class="lrow" style="border:0"><span class="k">Correlation clusters</span><span class="v">2 detected</span></div>
+        </div>
+      </div>
+    </section>
+  </main>
+</div>
+
+<script>
+  function tick(){
+    var d=new Date(), p=function(n){return String(n).padStart(2,'0')};
+    var el=document.getElementById('clock');
+    if(el) el.textContent=p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());
+  }
+  tick(); setInterval(tick,1000);
+</script>
+</body>
+</html>
