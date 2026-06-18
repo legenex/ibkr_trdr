@@ -19,6 +19,7 @@ mock without a live connection.
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional
@@ -46,11 +47,13 @@ from utils.logging import RUN_ID, get_logger
 # and connection work) but no order can be submitted: each order method checks
 # the gate and raises GuardrailsUnavailableError.
 try:
+    from risk.guardrails import RiskGate as _RiskGate
     from risk.guardrails import evaluate as _module_risk_evaluate
 
     _GUARDRAILS_IMPORT_ERROR: Optional[BaseException] = None
 except BaseException as exc:  # pragma: no cover - exercised only on a broken gate
     _module_risk_evaluate = None
+    _RiskGate = None  # type: ignore[assignment]
     _GUARDRAILS_IMPORT_ERROR = exc
 
 # Calendar lookback used to estimate average daily volume and recent returns for
@@ -79,6 +82,17 @@ class GuardrailsUnavailableError(BrokerError):
 
 class NakedOrderRejected(BrokerError):
     """Raised when an order would be submitted without a protective stop."""
+
+
+class TransientBrokerError(BrokerError):
+    """Raised when a broker call fails transiently (a socket blip, an ib_async
+    error mid-call). It is logged and audited so the trading cycle can catch it
+    and survive rather than crash; it never means an order was silently sent."""
+
+
+class EntriesPausedError(BrokerError):
+    """Raised when new entries are paused after post-reconnect reconciliation
+    drift. A reducing-safe state: exits and flattens are still allowed."""
 
 
 def _default_ib_factory() -> Any:
@@ -118,8 +132,15 @@ class IBKRClient:
         self._auto_reconnect = auto_reconnect
         self._deliberate_disconnect = False
 
-        # The risk gate, stored per-instance so tests can swap or disable it.
-        self._risk_evaluate = _module_risk_evaluate
+        # The risk gate, stored per-instance so tests can swap or disable it. A
+        # held RiskGate instance carries the session risk-budget state (committed
+        # dollar risk), so the same gate both sizes entries and is told what was
+        # committed. Falls back to the stateless module-level evaluate if the gate
+        # could not be imported (orders are then refused, as before).
+        self.risk_gate = _RiskGate(self.settings) if _RiskGate is not None else None
+        self._risk_evaluate = (
+            self.risk_gate.evaluate if self.risk_gate is not None else _module_risk_evaluate
+        )
 
         # Equity baselines for the drawdown circuit breakers. Tracked per UTC day
         # and ISO week as a best-effort in-process snapshot; the orchestrator may
@@ -141,6 +162,19 @@ class IBKRClient:
         self._last_port: Optional[int] = None
         self._last_mode: str = "PAPER"
         self._last_readonly: bool = False
+
+        # Unattended-operation hardening.
+        # Active market-data subscriptions (symbol -> callback) so they can be
+        # re-subscribed after a reconnect.
+        self._subscriptions: dict[str, Callable[[Any], None]] = {}
+        # Reconnect backoff: exponential, capped, with jitter (seeded centrally so
+        # runs reproduce; the jitter only spreads retries, it is never result-data).
+        self._max_backoff_seconds: float = 60.0
+        self._backoff_rng = random.Random(self.settings.random_seed)
+        # Reducing-safe pause: after post-reconnect drift, new entries are vetoed
+        # until the operator acknowledges; exits stay allowed.
+        self._new_entries_paused: bool = False
+        self._pause_reason: str = ""
 
         if _module_risk_evaluate is None:
             self.log.error(
@@ -258,7 +292,9 @@ class IBKRClient:
                 self._log_connect_failure(exc, host, port, mode, attempt, max_retries)
 
             if attempt < max_retries:
-                self._sleep(base_backoff * (2 ** (attempt - 1)))
+                delay = self._backoff_delay(attempt, base_backoff)
+                self.log.warning("ibkr_reconnect_backoff", attempt=attempt, next_delay_s=round(delay, 2))
+                self._sleep(delay)
 
         message = f"{_API_PORT_REMINDER} (mode={mode}, port={port}, last error: {last_error})"
         self.audit.record(
@@ -290,6 +326,19 @@ class IBKRClient:
         """Sleep for backoff. Separated so tests can stub it out."""
         if seconds > 0:
             time.sleep(seconds)
+
+    def _backoff_delay(self, attempt: int, base_backoff: float) -> float:
+        """Exponential backoff, capped at the max delay, with full jitter.
+
+        delay = uniform(0, min(max_backoff, base * 2**(attempt-1))). The cap keeps
+        a multi-week reconnect loop from blowing up to huge sleeps; the jitter
+        avoids a tight synchronized retry storm. Deterministic under the central
+        seed so runs reproduce.
+        """
+        ceiling = min(self._max_backoff_seconds, base_backoff * (2 ** (attempt - 1)))
+        if ceiling <= 0:
+            return 0.0
+        return self._backoff_rng.uniform(0.0, ceiling)
 
     def _wire_session(self) -> None:
         """Attach the data source and event handlers to the live session."""
@@ -334,7 +383,9 @@ class IBKRClient:
             {"host": self._last_host, "port": self._last_port, "mode": self._last_mode},
             "Reconnecting to IBKR",
         )
-        return self._do_connect(
+        # Client id discipline: reconnect REUSES the same client id, never
+        # increments. The orchestrator and API stay on their distinct ids.
+        ok = self._do_connect(
             self._last_host,
             self._last_port,
             self.settings.ibkr_client_id,
@@ -344,6 +395,69 @@ class IBKRClient:
             timeout,
             self._last_readonly,
         )
+        if ok:
+            self._resync_after_gap()
+        return ok
+
+    def _resync_after_gap(self) -> None:
+        """After a reconnect, restore state before resuming and reconcile.
+
+        Re-subscribes any market data, re-fetches open orders and positions, then
+        runs a FULL reconciliation. Local state is never assumed correct after a
+        gap: if reconciliation finds drift, new entries are paused (a reducing-safe
+        action) until the operator acknowledges, while exits stay allowed.
+        """
+        # Re-subscribe market data that was active before the drop.
+        for symbol, callback in list(self._subscriptions.items()):
+            try:
+                self._subscribe(symbol, callback)
+            except Exception as exc:  # noqa: BLE001
+                self.log.warning("resubscribe_failed", symbol=symbol, error=str(exc))
+
+        # Re-fetch broker-reported state before resuming.
+        try:
+            open_orders = self.open_orders()
+            positions = self.positions()
+            self.audit.record(
+                "RESYNC",
+                {"open_orders": len(open_orders), "positions": len(positions)},
+                "Re-fetched open orders and positions after reconnect",
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("resync_fetch_failed", error=str(exc))
+
+        # Full reconciliation. reconcile() audits RECONCILE / RECONCILE_DRIFT.
+        try:
+            report = self.reconcile()
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("resync_reconcile_failed", error=str(exc))
+            return
+        if not report.in_sync:
+            self._new_entries_paused = True
+            self._pause_reason = "reconciliation drift after reconnect"
+            self.log.warning("new_entries_paused", reason=self._pause_reason)
+            self.audit.record(
+                "ENTRIES_PAUSED",
+                {"position_drift": report.position_drift, "order_drift": report.order_drift},
+                "New entries paused after post-reconnect drift; exits still allowed. "
+                "Operator must acknowledge to resume.",
+            )
+
+    def acknowledge_drift(self, who: str = "operator") -> None:
+        """Clear the post-reconnect entries pause (an explicit operator action)."""
+        was_paused = self._new_entries_paused
+        self._new_entries_paused = False
+        self._pause_reason = ""
+        if was_paused:
+            self.audit.record(
+                "DRIFT_ACKNOWLEDGED", {"by": who},
+                f"{who} acknowledged reconnect drift; new entries may resume",
+            )
+
+    @property
+    def entries_paused(self) -> bool:
+        """True if new entries are paused pending a drift acknowledgement."""
+        return self._new_entries_paused
 
     def is_connected(self) -> bool:
         """True if the session is currently connected."""
@@ -621,6 +735,12 @@ class IBKRClient:
         """
         self._require_connected()
 
+        # place_order is an entry path (single entry with attached stop); refuse
+        # it while entries are paused after post-reconnect drift. Exits go through
+        # flatten_position, which stays allowed.
+        if self._new_entries_paused:
+            return self._paused_entry_result(order, OrderKind.SINGLE_WITH_STOP)
+
         if not order.has_stop:
             reason = "Rejected: place_order requires an attached protective stop (no naked order path)."
             self.log.error("naked_order_rejected", symbol=order.symbol)
@@ -637,13 +757,13 @@ class IBKRClient:
 
         parent = self._entry_order(order, quantity)
         parent.transmit = False
-        parent_trade = self.ib.placeOrder(contract, parent)
+        parent_trade = self._place_with_guard(contract, parent, order.symbol)
         parent_id = parent_trade.order.orderId
 
         stop = StopOrder(order.side.opposite.value, quantity, order.stop_price)
         stop.parentId = parent_id
         stop.transmit = True
-        stop_trade = self.ib.placeOrder(contract, stop)
+        stop_trade = self._place_with_guard(contract, stop, order.symbol)
 
         ids = [parent_id, stop_trade.order.orderId]
         self._record_submission(order, quantity, ids, OrderKind.SINGLE_WITH_STOP)
@@ -671,6 +791,11 @@ class IBKRClient:
         risk gate runs first; a veto submits nothing.
         """
         self._require_connected()
+
+        # New entries are paused after post-reconnect drift (reducing-safe). A
+        # bracket is always an entry, so it is refused; exits/flattens still run.
+        if self._new_entries_paused:
+            return self._paused_entry_result(order, OrderKind.BRACKET)
 
         entry = entry_price if entry_price is not None else order.limit_price
         stop = stop_price if stop_price is not None else order.stop_price
@@ -701,10 +826,24 @@ class IBKRClient:
 
         ids: list[int] = []
         for child in (bracket.parent, bracket.takeProfit, bracket.stopLoss):
-            trade = self.ib.placeOrder(contract, child)
+            trade = self._place_with_guard(contract, child, order.symbol)
             ids.append(trade.order.orderId)
 
         self._record_submission(order, quantity, ids, OrderKind.BRACKET)
+        # Charge the session risk budget with this entry's per-trade dollar risk
+        # (placed quantity x distance to stop). Exits never reach here. Audited so
+        # the console (a separate process) can mirror today's committed risk.
+        if self.risk_gate is not None:
+            idea_risk = quantity * abs(entry - stop)
+            self.risk_gate.commit_entry_risk(idea_risk)
+            self.audit.record(
+                "SESSION_RISK_COMMITTED",
+                {"symbol": order.symbol, "idea_risk_usd": round(idea_risk, 2),
+                 "committed_usd": round(self.risk_gate.committed_risk_usd, 2),
+                 "budget_usd": self.settings.session_risk_budget_usd},
+                f"Committed ${idea_risk:.2f} entry risk on {order.symbol} "
+                f"(session total ${self.risk_gate.committed_risk_usd:.2f})",
+            )
         return OrderPlacementResult(
             accepted=True,
             reason="submitted native bracket (entry, stop, target)",
@@ -713,6 +852,45 @@ class IBKRClient:
             ib_order_ids=ids,
             symbol=order.symbol,
         )
+
+    def reset_session_risk(self) -> None:
+        """Reset the gate's committed session risk (call at session start)."""
+        if self.risk_gate is not None:
+            self.risk_gate.reset_session()
+
+    def _paused_entry_result(self, order: Order, kind: OrderKind) -> OrderPlacementResult:
+        """A non-accepting result for an entry refused while entries are paused."""
+        reason = (
+            f"new entries paused ({self._pause_reason}); refusing to open {order.symbol}. "
+            "Exits and flattens are still allowed. Acknowledge the drift to resume."
+        )
+        self.log.warning("entry_refused_paused", symbol=order.symbol, reason=self._pause_reason)
+        self.audit.record("ENTRY_REFUSED_PAUSED", {"symbol": order.symbol}, reason)
+        return OrderPlacementResult(
+            accepted=False, reason=reason, kind=kind,
+            risk_decision=RiskDecision(approved=False, reason=reason),
+            ib_order_ids=[], symbol=order.symbol,
+        )
+
+    def _place_with_guard(self, contract: Any, child: Any, symbol: str) -> Any:
+        """Place one order, converting a transient broker failure to a typed error.
+
+        A blip in ib_async/the socket raises TransientBrokerError (logged and
+        audited) instead of an arbitrary exception, so the trading cycle can catch
+        it and survive rather than crash. NotConnectedError is left to propagate.
+        """
+        try:
+            return self.ib.placeOrder(contract, child)
+        except NotConnectedError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            self.log.error("order_place_transient_error", symbol=symbol, error=str(exc))
+            self.audit.record(
+                "BROKER_TRANSIENT_ERROR",
+                {"symbol": symbol, "op": "placeOrder", "error": str(exc)},
+                f"Transient broker error placing {symbol}: {exc}",
+            )
+            raise TransientBrokerError(f"transient error placing {symbol}: {exc}") from exc
 
     def flatten_position(self, symbol: str) -> OrderPlacementResult:
         """Flatten an open position with a closing market order (manual exit).
@@ -926,8 +1104,14 @@ class IBKRClient:
         """Subscribe to streaming ticks for symbol; invoke callback on updates.
 
         Returns the ib_async Ticker. The callback fires whenever this symbol's
-        ticker updates.
+        ticker updates. The subscription is remembered so it can be restored
+        automatically after a reconnect.
         """
+        self._subscriptions[symbol] = callback
+        return self._subscribe(symbol, callback)
+
+    def _subscribe(self, symbol: str, callback: Callable[[Any], None]) -> Any:
+        """Wire one market-data subscription (used live and on reconnect resync)."""
         ib = self._require_connected()
         contract = self._data_source._stock(symbol)  # qualified contract
         ticker = ib.reqMktData(contract, "", False, False)
@@ -1007,4 +1191,12 @@ class IBKRClient:
             },
             "Reconciliation in sync" if in_sync else "Reconciliation drift detected",
         )
+        if not in_sync:
+            # Drift is never assumed away: it is audited under its own event so the
+            # operator and the console see it distinctly from a clean reconcile.
+            self.audit.record(
+                "RECONCILE_DRIFT",
+                {"position_drift": position_drift, "order_drift": order_drift},
+                "Drift between local intended state and IBKR-reported state",
+            )
         return report

@@ -185,10 +185,15 @@ def render_sidebar() -> Any:
         )
     st.session_state.risk_overrides = overrides
     st.session_state.discovery_capital = st.sidebar.number_input(
-        "Risk capital for discovery today ($)", min_value=0.0,
-        value=float(st.session_state.discovery_capital), step=500.0,
+        "Session risk budget today ($, 0 = off)", min_value=0.0,
+        value=float(getattr(SETTINGS, "session_risk_budget_usd", 0.0) or 0.0), step=500.0,
+        disabled=True,
     )
-    st.sidebar.caption("Sliders set this session's view. To enforce limits live, set them in .env.")
+    st.sidebar.caption(
+        "The percent sliders above set this session's view. The session risk budget is an "
+        "ENFORCED gate cap (set it in the web console or .env): the gate shrinks or vetoes new "
+        "entries to fit it, and a change is audited as RISK_LIMIT_CHANGED."
+    )
     return effective_settings(SETTINGS, overrides)
 
 

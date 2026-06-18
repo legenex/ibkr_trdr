@@ -314,6 +314,8 @@ const RISK_FIELDS: { key: string; label: string; step: number }[] = [
   { key: "max_adv_participation_pct", label: "Max ADV participation %", step: 0.5 },
   { key: "correlation_cluster_threshold", label: "Correlation cluster threshold", step: 0.05 },
   { key: "correlation_min_periods", label: "Correlation min periods", step: 1 },
+  { key: "session_risk_budget_usd", label: "Session risk budget $ (0 = off)", step: 100 },
+  { key: "max_risk_per_idea_usd", label: "Max risk per idea $ (0 = off)", step: 50 },
 ];
 
 function TradingPanel({ view, reload }: { view: SettingsView; reload: () => Promise<void> }) {

@@ -47,6 +47,14 @@ export interface Meter {
   level: Level;
 }
 
+export interface SessionRiskBudget {
+  enabled: boolean;
+  budget_usd: number;
+  max_per_idea_usd: number;
+  committed_usd: number;
+  remaining_usd: number | null;
+}
+
 export interface Risk {
   risk_per_trade_pct: number;
   gross_exposure: Meter;
@@ -54,6 +62,7 @@ export interface Risk {
   weekly_drawdown: Meter;
   single_name_weight_pct: number;
   max_leverage: number;
+  session_risk_budget?: SessionRiskBudget;
 }
 
 export interface CircuitBreaker {

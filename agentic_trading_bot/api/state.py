@@ -264,6 +264,32 @@ class ApiState:
             "weekly_drawdown": {"used_pct": 0.0, "limit_pct": s.max_weekly_drawdown_pct, "level": "ok"},
             "single_name_weight_pct": s.max_single_name_weight_pct,
             "max_leverage": s.max_leverage,
+            "session_risk_budget": self._session_risk_budget(),
+        }
+
+    def _session_risk_budget(self) -> dict[str, Any]:
+        """Session discovery risk budget: configured cap and today's committed risk.
+
+        The enforcing counter lives on the orchestrator's risk gate (a separate
+        process), so this mirrors it honestly from the shared audit trail: it sums
+        today's committed entry risk. When the cap is 0 it is disabled and
+        `remaining_usd` is null (the percent limits alone govern).
+        """
+        budget = self.settings.session_risk_budget_usd
+        committed = 0.0
+        try:
+            today = datetime.now(timezone.utc).date().isoformat()
+            for e in self.audit.read_all():
+                if e.event_type == "SESSION_RISK_COMMITTED" and str(e.ts_utc).startswith(today):
+                    committed += float(e.payload.get("idea_risk_usd", 0.0))
+        except Exception:  # noqa: BLE001
+            committed = 0.0
+        return {
+            "enabled": budget > 0,
+            "budget_usd": budget,
+            "max_per_idea_usd": self.settings.max_risk_per_idea_usd,
+            "committed_usd": round(committed, 2),
+            "remaining_usd": round(max(0.0, budget - committed), 2) if budget > 0 else None,
         }
 
     # -------------------------------------------------------------- activity

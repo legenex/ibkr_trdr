@@ -46,6 +46,22 @@ export function InstrumentCluster({ snap }: { snap: CommandSnapshot }) {
         <Meter name="Gross exposure" meter={risk.gross_exposure} />
         <Meter name="Daily drawdown" meter={risk.daily_drawdown} />
         <Meter name="Weekly drawdown" meter={risk.weekly_drawdown} />
+        {risk.session_risk_budget?.enabled && (
+          <div>
+            <Eyebrow>Session Risk Budget</Eyebrow>
+            <div className="stat-value">
+              <AnimatedNumber
+                value={risk.session_risk_budget.remaining_usd ?? 0}
+                format={fmtMoney}
+                polarity="neutral"
+              />
+            </div>
+            <div className="stat-sub">
+              of {fmtMoney(risk.session_risk_budget.budget_usd)} left today ·{" "}
+              {fmtMoney(risk.session_risk_budget.committed_usd)} committed
+            </div>
+          </div>
+        )}
         <div>
           <Eyebrow>Circuit Breaker</Eyebrow>
           <div className="row" style={{ marginTop: 8 }}>

@@ -682,7 +682,16 @@ class Experiment(BaseModel):
 
 
 class TradeTrace(BaseModel):
-    """The full trace of a closed trade fed to the reflection step (read-only)."""
+    """The full trace of a closed trade fed to the reflection step (read-only).
+
+    The original fields (pnl, costs, regime, family, extra) are unchanged so every
+    existing caller keeps working. The fields below were added for the
+    trade-attribution layer (provenance ledger -> close detection): they carry the
+    closed portion's entry/exit fills, gross and net PnL stored separately, a cost
+    breakdown, the regime captured AT ENTRY (never reconstructed), and the
+    originating strategy/skill/proposal ids. All have defaults, so a TradeTrace
+    built the old way validates exactly as before.
+    """
 
     trace_ref: str
     theme: str = ""
@@ -695,6 +704,18 @@ class TradeTrace(BaseModel):
     outcome: str = ""
     family: str = ""
     extra: dict[str, Any] = Field(default_factory=dict)
+
+    # --- trade-attribution additions (all optional/defaulted) ---
+    gross_pnl: float = 0.0
+    net_pnl: float = 0.0
+    closed_qty: float = 0.0
+    regime_at_entry: str = ""
+    originating_strategy_id: Optional[str] = None
+    originating_skill_id: Optional[str] = None
+    originating_proposal_id: Optional[str] = None
+    entry_fills: list[dict[str, Any]] = Field(default_factory=list)
+    exit_fills: list[dict[str, Any]] = Field(default_factory=list)
+    cost_breakdown: dict[str, float] = Field(default_factory=dict)
 
 
 class LearningResult(BaseModel):

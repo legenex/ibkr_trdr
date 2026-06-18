@@ -54,6 +54,7 @@ class Orchestrator:
         skill_registry: Any = None,
         ledger: Any = None,
         holdout_budget: Any = None,
+        provenance: Any = None,
         lookback_days: int = 400,
     ) -> None:
         """Create the orchestrator from its injected collaborators."""
@@ -68,12 +69,18 @@ class Orchestrator:
         self.skill_registry = skill_registry
         self.ledger = ledger
         self.holdout_budget = holdout_budget
+        self.provenance = provenance
         self.lookback_days = lookback_days
         self.log = get_logger(__name__)
 
         self._cycle = 0
         self._day_anchor: Optional[float] = None
         self._week_anchor: Optional[float] = None
+        # The RegimeState captured at the most recent regime refresh, snapshotted
+        # into a provenance row at entry (never reconstructed later).
+        self._last_regime_state: Any = None
+        # Prior cycle's broker positions {symbol: signed qty}, for close detection.
+        self._prev_positions: Optional[dict[str, float]] = None
 
     # --------------------------------------------------------- trading cycle
 
@@ -84,6 +91,7 @@ class Orchestrator:
         summary: dict[str, Any] = {
             "cycle": cycle_id, "ts_utc": _utc_now_iso(), "regime": None,
             "halted": False, "halt_reason": "", "submitted": [], "in_sync": None,
+            "traces_recorded": 0,
         }
 
         # 1. Kill switch and circuit breakers FIRST, before anything else.
@@ -99,6 +107,11 @@ class Orchestrator:
         # 3. Trade approved strategies (skipped while halted).
         if not halted:
             summary["submitted"] = self._trade_approved_strategies()
+
+        # 3.5 Attribute fills and detect closes. This is read-only and runs EVERY
+        # cycle, even while halted: a protective stop can fill at the broker while
+        # the kill switch is on, and that closed trade must still be traced.
+        summary["traces_recorded"] = len(self._attribute_and_detect())
 
         # 4. Reconcile against the broker and log drift.
         summary["in_sync"] = self._reconcile()
@@ -132,8 +145,15 @@ class Orchestrator:
         return False, ""
 
     def reset_daily_anchor(self) -> None:
-        """Reset the daily drawdown anchor (call at the start of each session)."""
+        """Reset the daily drawdown anchor (call at the start of each session).
+
+        Resets the session risk budget in lockstep with the drawdown anchor, so
+        today's committed-risk counter starts fresh alongside the breakers.
+        """
         self._day_anchor = self._net_liquidation()
+        reset = getattr(self.broker, "reset_session_risk", None)
+        if callable(reset):
+            reset()
 
     def _net_liquidation(self) -> Optional[float]:
         try:
@@ -151,6 +171,8 @@ class Orchestrator:
             if getattr(self.detector, "model", None) is None:
                 self.detector.fit(bars)
             state = self.detector.predict_last(bars)
+            # Snapshot the full RegimeState for entry attribution; never recomputed.
+            self._last_regime_state = state
             return state.regime.value if state is not None else None
         except Exception as exc:  # noqa: BLE001
             self.log.warning("regime_refresh_failed", error=str(exc))
@@ -187,10 +209,37 @@ class Orchestrator:
                     )
                     submitted.append({"symbol": symbol, "accepted": result.accepted,
                                       "reason": result.reason, "ids": result.ib_order_ids})
+                    if result.accepted:
+                        self._open_provenance(order, result, record, spec)
                 except Exception as exc:  # noqa: BLE001
                     self.log.error("bracket_submit_failed", symbol=symbol, error=str(exc))
                     submitted.append({"symbol": symbol, "accepted": False, "reason": str(exc)})
         return submitted
+
+    def _open_provenance(self, order: Order, result: Any, record: dict[str, Any],
+                         spec: dict[str, Any]) -> None:
+        """Open a provenance row for an accepted entry (captures entry regime now)."""
+        if self.provenance is None:
+            return
+        # The skill that shaped this strategy, if any, is recorded on the spec.
+        applied = spec.get("applied_skills") or spec.get("applied_skill_ids") or []
+        skill_id = applied[0] if isinstance(applied, list) and applied else None
+        intended = getattr(result.risk_decision, "adjusted_quantity", None) or 0.0
+        try:
+            self.provenance.open_position(
+                symbol=order.symbol,
+                entry_side=order.side,
+                intended_qty=float(intended),
+                originating_strategy_id=record.get("template") or record.get("name"),
+                originating_skill_id=skill_id,
+                originating_proposal_id=record.get("proposal_id"),
+                intended_stop=spec.get("intended_stop"),
+                entry_order_ids=list(result.ib_order_ids[:1]),
+                entry_regime=self._last_regime_state,
+                opened_at=_utc_now_iso(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("provenance_open_failed", symbol=order.symbol, error=str(exc))
 
     def _signal_to_bracket(
         self, template: str, params: dict[str, Any], symbol: str
@@ -228,6 +277,164 @@ class Orchestrator:
         except Exception as exc:  # noqa: BLE001
             self.log.warning("reconcile_failed", error=str(exc))
             return None
+
+    # ------------------------------------------------- trade attribution
+
+    _QTY_TOL = 1e-9
+
+    def _broker_connected(self) -> bool:
+        check = getattr(self.broker, "is_connected", None)
+        try:
+            return bool(check()) if callable(check) else True
+        except Exception:  # noqa: BLE001
+            return False
+
+    def _attribute_and_detect(self) -> list[Any]:
+        """Record this cycle's fills and assemble traces for any closed portions.
+
+        Read-only with respect to the broker. Yields nothing when no provenance
+        ledger is wired or the broker is disconnected (so a flat/down book can
+        never fabricate a trace).
+        """
+        if self.provenance is None or not self._broker_connected():
+            return []
+        try:
+            fills = self.broker.recent_fills()
+            positions = {p.symbol: p.quantity for p in self.broker.positions()}
+        except Exception as exc:  # noqa: BLE001
+            self.log.warning("attribution_read_failed", error=str(exc))
+            return []
+        self._attribute_fills(fills)
+        traces = self._detect_closes(self._prev_positions or {}, positions)
+        self._prev_positions = positions
+        return traces
+
+    def _attribute_fills(self, fills: list[Any]) -> None:
+        """Attribute each new fill to its single open lot by symbol and side.
+
+        A symbol with no open lot is not ours (ignored). A symbol with more than
+        one open lot is ambiguous: we do not attribute, and the close detector
+        will audit TRACE_UNATTRIBUTED rather than guess. Idempotent by exec_id, so
+        replaying a fill never double-counts.
+        """
+        for fill in fills:
+            if self.provenance.has_fill(fill):
+                continue
+            rows = self.provenance.open_rows_for(fill.symbol)
+            if len(rows) != 1:
+                continue
+            row = rows[0]
+            if fill.side.value == row.entry_side:
+                self.provenance.record_entry_fill(row.provenance_id, fill)
+            else:
+                self.provenance.record_exit_fill(row.provenance_id, fill)
+
+    def _detect_closes(self, prior: dict[str, float],
+                       current: dict[str, float]) -> list[Any]:
+        """Compare prior and current positions; trace any reduced/closed lot."""
+        from learning.provenance import STATUS_CLOSED
+
+        traces: list[Any] = []
+        symbols = {r.symbol for r in self.provenance.open_rows()}
+        for symbol in sorted(symbols):
+            prior_q = prior.get(symbol, 0.0)
+            curr_q = current.get(symbol, 0.0)
+            decreased = abs(curr_q) < abs(prior_q) - self._QTY_TOL
+            flipped = prior_q != 0.0 and curr_q != 0.0 and (prior_q > 0) != (curr_q > 0)
+            if not (decreased or flipped):
+                continue
+
+            rows = self.provenance.open_rows_for(symbol)
+            if len(rows) != 1:
+                self.audit.record(
+                    "TRACE_UNATTRIBUTED",
+                    {"symbol": symbol, "open_lots": len(rows), "reason": "ambiguous"},
+                    f"Close on {symbol} could not be attributed: {len(rows)} open lots",
+                )
+                continue
+            row = rows[0]
+            closed_qty = row.filled_qty if flipped else max(0.0, row.filled_qty - abs(curr_q))
+            if closed_qty <= self._QTY_TOL:
+                continue
+
+            exit_fills = self.provenance.unconsumed_exit_fills(row.provenance_id)
+            total_exit_qty = sum(f.quantity for f in exit_fills)
+            if not exit_fills or total_exit_qty + self._QTY_TOL < closed_qty:
+                self.audit.record(
+                    "TRACE_UNATTRIBUTED",
+                    {"symbol": symbol, "closed_qty": closed_qty,
+                     "exit_fill_qty": total_exit_qty, "reason": "no matching exit fills"},
+                    f"Close on {symbol} could not be attributed: position dropped without "
+                    "matching exit fills (gap or restart); not fabricating a trace",
+                )
+                continue
+
+            trace = self._assemble_trace(row, exit_fills, closed_qty)
+            self.provenance.record_trace(trace, row.provenance_id)
+            self.provenance.consume_exit_fills(row.provenance_id)
+            fully_closed = closed_qty >= row.filled_qty - self._QTY_TOL
+            if fully_closed:
+                self.provenance.close_row(row.provenance_id, _utc_now_iso())
+            else:
+                self.provenance.reduce_position(row.provenance_id, closed_qty)
+            self.audit.record(
+                "TRACE_RECORDED",
+                {"symbol": symbol, "provenance_id": row.provenance_id,
+                 "originating_strategy_id": row.originating_strategy_id,
+                 "originating_proposal_id": row.originating_proposal_id,
+                 "closed_qty": closed_qty, "net_pnl": round(trace.net_pnl, 4),
+                 "status": STATUS_CLOSED if fully_closed else "reduced"},
+                f"Recorded trace for {symbol}: closed {closed_qty:g}, net PnL {trace.net_pnl:.2f}",
+            )
+            traces.append(trace)
+        return traces
+
+    def _assemble_trace(self, row: Any, exit_fills: list[Any], closed_qty: float) -> TradeTrace:
+        """Build a TradeTrace for the closed portion. Gross and net stored apart."""
+        total_exit_qty = sum(f.quantity for f in exit_fills) or 1.0
+        avg_exit_price = sum(f.price * f.quantity for f in exit_fills) / total_exit_qty
+        exit_commission_total = sum(float(f.commission or 0.0) for f in exit_fills)
+
+        share = closed_qty / row.filled_qty if row.filled_qty > self._QTY_TOL else 1.0
+        entry_cost_portion = row.entry_cost * share
+        exit_cost_portion = exit_commission_total * (closed_qty / total_exit_qty)
+        if row.entry_sign > 0:
+            gross_pnl = (avg_exit_price - row.avg_entry_price) * closed_qty
+        else:
+            gross_pnl = (row.avg_entry_price - avg_exit_price) * closed_qty
+        total_costs = entry_cost_portion + exit_cost_portion
+        net_pnl = gross_pnl - total_costs
+
+        regime_state = row.regime_state()
+        regime_label = regime_state.regime.value if regime_state is not None else ""
+        entry_fills = self.provenance.entry_fills(row.provenance_id)
+        now = _utc_now_iso()
+        return TradeTrace(
+            trace_ref=f"{row.symbol}-{row.provenance_id}-{now}",
+            regime=regime_label,
+            regime_at_entry=regime_label,
+            pnl=net_pnl,
+            costs=total_costs,
+            gross_pnl=gross_pnl,
+            net_pnl=net_pnl,
+            closed_qty=closed_qty,
+            family=row.originating_strategy_id or "default",
+            originating_strategy_id=row.originating_strategy_id,
+            originating_skill_id=row.originating_skill_id,
+            originating_proposal_id=row.originating_proposal_id,
+            outcome=(f"{row.entry_side} {row.symbol}: closed {closed_qty:g} @ "
+                     f"{avg_exit_price:.2f} from entry {row.avg_entry_price:.2f}, "
+                     f"net {net_pnl:.2f}"),
+            entry_fills=[f.model_dump() for f in entry_fills],
+            exit_fills=[f.model_dump() for f in exit_fills],
+            cost_breakdown={
+                "entry_commission": round(entry_cost_portion, 6),
+                "exit_commission": round(exit_cost_portion, 6),
+                "total": round(total_costs, 6),
+            },
+            extra={"symbol": row.symbol, "provenance_id": row.provenance_id,
+                   "avg_exit_price": avg_exit_price, "closed_at": now},
+        )
 
     def _recent_bars(self, symbol: str) -> Any:
         from datetime import date, timedelta
@@ -306,6 +513,7 @@ def build_orchestrator(settings: Settings = default_settings, *, connect: bool =
     from discovery.approval_queue import ApprovalQueue
     from discovery.research_pipeline import offline_provider
     from learning.holdout_budget import HoldoutBudget
+    from learning.provenance import ProvenanceLedger
     from learning.registry import SkillRegistry
     from learning.trial_ledger import TrialLedger
     from models.regime_detector import RegimeDetector
@@ -329,6 +537,7 @@ def build_orchestrator(settings: Settings = default_settings, *, connect: bool =
         provider=offline_provider(settings.discovery_theme, settings.watchlist_symbols),
         skill_registry=SkillRegistry(learning_db), ledger=TrialLedger(learning_db),
         holdout_budget=HoldoutBudget(learning_db),
+        provenance=ProvenanceLedger(learning_db),
     )
 
 
@@ -391,33 +600,65 @@ def _add_jobs(scheduler: Any, orchestrator: Orchestrator, settings: Settings, lo
         log.info("learning_scheduled", cadence=settings.learning_cadence, interval_minutes=minutes)
 
 
-def _learning_tick(orchestrator: Orchestrator, settings: Settings, log: Any) -> None:
-    """Scheduled learning hook. Honest about needing a wired trade-trace source.
+def _next_unburned_tranche(orchestrator: Orchestrator) -> Optional[str]:
+    """The id of the next holdout tranche with evaluations left, or None."""
+    budget = orchestrator.holdout_budget
+    if budget is None:
+        return None
+    try:
+        info = budget.remaining_budget()
+    except Exception:  # noqa: BLE001
+        return None
+    for tranche in info.get("tranches", []):
+        if not tranche.get("burned") and int(tranche.get("remaining", 0)) > 0:
+            return tranche.get("tranche_id")
+    return None
 
-    A learning cycle requires a real closed-trade trace; this harness never
-    fabricates trade data to feed its own loop. If the operator has attached a
-    `trace_builder` to the orchestrator (returning a (TradeTrace, tranche_id) or
-    None), we run one disciplined cycle; otherwise we log a clear skip. Either
-    way nothing is executed and the risk gate is never touched.
+
+def _learning_tick(orchestrator: Orchestrator, settings: Settings, log: Any) -> None:
+    """Consume real closed-trade traces from the provenance ledger and reflect.
+
+    For each new, unprocessed TradeTrace the provenance layer recorded, run the
+    existing learning cycle (reflect -> hypothesize -> experiment -> promotion per
+    the taxonomy) and mark the trace processed so it is reflected on exactly once,
+    even across restarts. With no new traces, log an honest LEARNING_SKIPPED. The
+    kill switch pauses the whole tick; nothing here ever executes or fabricates a
+    trade, and the risk gate is never touched (CLAUDE.md invariants 9 to 15).
     """
-    builder = getattr(orchestrator, "trace_builder", None)
-    if builder is None:
-        orchestrator.audit.record(
-            "LEARNING_SKIPPED",
-            {"reason": "no closed-trade trace source wired"},
-            "Learning cadence fired but no trade-trace source is wired; skipped (propose-only, "
-            "nothing executed). See the runbook to attach one.",
-        )
+    audit = orchestrator.audit
+
+    # The kill switch pauses the learning tick entirely (invariant 9/10).
+    if kill_switch_engaged(settings):
+        audit.record("LEARNING_PAUSED", {"reason": "kill switch engaged"},
+                     "Learning tick paused while the kill switch is on")
+        return
+
+    prov = orchestrator.provenance
+    if prov is None:
+        audit.record("LEARNING_SKIPPED", {"reason": "no provenance ledger wired"},
+                     "Learning tick: no provenance ledger; nothing to reflect on")
         return
     try:
-        built = builder()
+        pending = prov.list_unprocessed_traces()
     except Exception as exc:  # noqa: BLE001
-        log.warning("learning_trace_build_failed", error=str(exc))
+        log.warning("learning_trace_query_failed", error=str(exc))
         return
-    if not built:
+    if not pending:
+        audit.record("LEARNING_SKIPPED", {"reason": "no new closed-trade traces"},
+                     "Learning tick: no new closed-trade traces to reflect on; skipped honestly")
         return
-    trace, tranche_id = built
-    orchestrator.run_learning_cycle(trace, tranche_id)
+
+    for trace_id, trace in pending:
+        tranche_id = _next_unburned_tranche(orchestrator)
+        if tranche_id is None:
+            audit.record("LEARNING_BUDGET_EXHAUSTED", {"pending_traces": len(pending)},
+                         "Holdout budget exhausted; deferring remaining traces (no promotion)")
+            break
+        result = orchestrator.run_learning_cycle(trace, tranche_id)
+        # Mark processed only once a real Reflection was produced, so a paused or
+        # budget-skipped tick leaves the trace to be retried later (idempotent).
+        if result is not None and getattr(result, "reflections_count", 0) >= 1:
+            prov.mark_trace_processed(trace_id)
 
 
 def run_scheduler(

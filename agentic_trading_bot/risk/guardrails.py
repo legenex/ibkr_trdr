@@ -47,6 +47,11 @@ class RiskGate:
         """Create the gate bound to a set of configured limits."""
         self.s = settings
         self.log = get_logger(__name__)
+        # Per-trade dollar risk committed to NEW entries since the session start.
+        # Reset by reset_session() (called at session start, like the drawdown
+        # anchors) and added to by commit_entry_risk() when an entry is placed.
+        # This is the ONLY mutable state on the gate, and it can only tighten.
+        self._committed_risk_usd: float = 0.0
 
     # ----------------------------------------------------------------- public
 
@@ -117,6 +122,16 @@ class RiskGate:
                     f"by risk-per-trade limit ({self.s.risk_per_trade_pct}% of equity)"
                 )
 
+        # 3b. Session discovery risk budget: dollar caps that sit UNDERNEATH the
+        #     percent limit above and can only tighten size further (invariant 2
+        #     and 10). A single idea is capped at max_risk_per_idea_usd; the
+        #     session total is capped at session_risk_budget_usd minus what is
+        #     already committed today. Either can shrink to fit or veto.
+        if order.stop_price is not None and entry_price is not None:
+            adjusted_quantity = self._apply_dollar_risk_caps(
+                order, entry_price, adjusted_quantity, vetoes, notes
+            )
+
         # 2. Drawdown circuit breakers (entries only; exits already returned).
         vetoes.extend(self._drawdown_vetoes(account_state))
 
@@ -169,6 +184,99 @@ class RiskGate:
             return 0
         risk_budget = equity * (self.s.risk_per_trade_pct / 100.0)
         return int(math.floor(risk_budget / per_share_risk))
+
+    # ------------------------------------------- check: session risk budget
+
+    def _apply_dollar_risk_caps(
+        self,
+        order: Order,
+        entry_price: float,
+        quantity: float,
+        vetoes: list[str],
+        notes: list[str],
+    ) -> float:
+        """Shrink quantity to fit the per-idea and session dollar-risk caps.
+
+        Both caps are disabled when their setting is 0. They only ever reduce the
+        size; if not even one share fits, a veto is appended. This never grows the
+        order and never blocks an exit (exits return before this is reached).
+        """
+        per_share_risk = abs(entry_price - order.stop_price)  # type: ignore[arg-type]
+        if per_share_risk <= 0:
+            return quantity
+
+        # Per-idea cap.
+        per_idea = self.s.max_risk_per_idea_usd
+        if per_idea and per_idea > 0 and quantity * per_share_risk > per_idea + 1e-9:
+            max_shares = int(math.floor(per_idea / per_share_risk))
+            if max_shares < 1:
+                vetoes.append(
+                    f"per-idea risk cap ${per_idea:.2f} cannot fit a single share of "
+                    f"{order.symbol} (stop distance {per_share_risk:.4f})"
+                )
+                return quantity
+            notes.append(
+                f"size shrunk from {quantity:g} to {max_shares:g} shares by the per-idea "
+                f"risk cap (${per_idea:.2f})"
+            )
+            quantity = float(max_shares)
+
+        # Session budget cap (what is left of today's budget for new ideas).
+        budget = self.s.session_risk_budget_usd
+        if budget and budget > 0:
+            remaining = max(0.0, budget - self._committed_risk_usd)
+            if quantity * per_share_risk > remaining + 1e-9:
+                max_shares = int(math.floor(remaining / per_share_risk))
+                if max_shares < 1:
+                    vetoes.append(
+                        f"session risk budget exhausted: ${remaining:.2f} of ${budget:.2f} "
+                        f"remaining today cannot fit a single share of {order.symbol}"
+                    )
+                    return quantity
+                notes.append(
+                    f"size shrunk from {quantity:g} to {max_shares:g} shares to fit the "
+                    f"${remaining:.2f} remaining of today's ${budget:.2f} session risk budget"
+                )
+                quantity = float(max_shares)
+        return quantity
+
+    # ----------------------------------- session risk budget: state & helpers
+
+    def reset_session(self) -> None:
+        """Reset committed session risk to zero (call at session start)."""
+        self._committed_risk_usd = 0.0
+
+    def commit_entry_risk(self, dollar_risk: float) -> None:
+        """Record the per-trade dollar risk of a newly opened entry."""
+        if dollar_risk and dollar_risk > 0:
+            self._committed_risk_usd += float(dollar_risk)
+
+    @property
+    def committed_risk_usd(self) -> float:
+        """Per-trade dollar risk committed to new entries this session."""
+        return self._committed_risk_usd
+
+    def remaining_session_budget(self) -> Optional[float]:
+        """Dollars of session risk budget left today, or None if the cap is off."""
+        budget = self.s.session_risk_budget_usd
+        if not budget or budget <= 0:
+            return None
+        return max(0.0, budget - self._committed_risk_usd)
+
+    def entry_dollar_risk(
+        self, order: Order, quantity: float, account_state: AccountState
+    ) -> Optional[float]:
+        """Per-trade dollar risk of an entry (qty x stop distance), or None.
+
+        Returns None for an exit or when the order cannot be priced/stopped, so a
+        caller can commit only genuine new-entry risk.
+        """
+        if self._is_exit(order, account_state) or order.stop_price is None:
+            return None
+        entry_price = self._entry_price(order, account_state)
+        if entry_price is None:
+            return None
+        return float(quantity) * abs(entry_price - order.stop_price)
 
     # ------------------------------------------------------- check: drawdown
 

@@ -26,6 +26,8 @@ RISK_LIMIT_FIELDS: tuple[str, ...] = (
     "max_leverage",
     "correlation_cluster_threshold",
     "correlation_min_periods",
+    "session_risk_budget_usd",
+    "max_risk_per_idea_usd",
 )
 
 

@@ -85,6 +85,15 @@ class Settings(BaseSettings):
     # Minimum overlapping return observations before a correlation is trusted.
     correlation_min_periods: int = Field(default=20, ge=2)
 
+    # --- Session discovery risk budget (dollar caps; 0 disables a cap) ---
+    # The total per-trade dollar risk (quantity x distance to stop) you are
+    # willing to commit to NEW ideas today, and the most any single new idea may
+    # risk. These are CAPS that sit UNDERNEATH the percent-of-equity limits above:
+    # they can only ever tighten the size the gate would otherwise allow, never
+    # expand it. 0 means the cap is disabled (the percent limits alone govern).
+    session_risk_budget_usd: float = Field(default=0.0, ge=0, le=10_000_000)
+    max_risk_per_idea_usd: float = Field(default=0.0, ge=0, le=10_000_000)
+
     # --- Operations / paths ---
     kill_switch_file: str = Field(default="journal/KILL_SWITCH")
     journal_dir: str = Field(default="journal")
